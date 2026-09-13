@@ -97,6 +97,7 @@ export function codexSource({ roots }) {
         limitType: last.limitType,
         resetLine: null,
         resetAt: last.resetAt,
+        reason: last.reachedType || null,
         origin: meta.originator,
         timestampMs: last.timestampMs,
       }];
@@ -218,6 +219,7 @@ export function dispatchCandidate(c) {
     lastError: null,
   };
   if (c.env) record.env = c.env;   // e.g. CLAUDE_CONFIG_DIR for sandboxed desktop sessions
+  if (c.reason) record.limitReason = c.reason;   // e.g. Codex's rate_limit_reached_type
   // Raw reset without margin for calibration window math.
   const rawResetMs = c.resetAt != null
     ? c.resetAt
@@ -236,7 +238,7 @@ export function dispatchCandidate(c) {
   upsertSession(record, {
     after: calSample ? (state) => applyCalibrationToState(state, calSample) : null,
   });
-  log(`limit stop via transcript: agent=${c.agent} session=${c.sessionId || '?'} origin=${c.origin || '?'} resetAt=${new Date(at).toISOString()} (${source})`);
+  log(`limit stop via transcript: agent=${c.agent} session=${c.sessionId || '?'} origin=${c.origin || '?'} resetAt=${new Date(at).toISOString()} (${source})${c.reason ? ` reason=${c.reason}` : ''}`);
   notify('limit hit 😴', `${c.cwd || c.agent}: tracked — resumes when the limit resets`);
 }
 

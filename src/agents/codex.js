@@ -123,6 +123,9 @@ export default {
   experimental: false,
   patterns,
   menu: null,                      // no interactive limit menu
+  // What to do about a workspace wall (credits depleted, workspace cap): no
+  // window reset clears it, so the resumer's ceiling notification names this.
+  modelRemedy: 'add credits to the ChatGPT workspace (or ask its owner to), then `unsnooze resume-now`',
   // Resume takes the prompt in argv — `codex resume <id> "msg"` starts the turn
   // immediately, nothing to type into the TUI.
   //
