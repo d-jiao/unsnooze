@@ -33,9 +33,12 @@ export function candidateNames(name, platform = process.platform) {
 // { path, launchable } or null when nothing is found.
 export function resolveBin(bin, { env = process.env, exists = existsSync, platform = process.platform } = {}) {
   if (typeof bin !== 'string' || bin === '') return null;
-  const api = platform === 'win32' ? win32 : posix;
   const shim = p => /\.(cmd|bat)$/i.test(p);
-  if (api.isAbsolute(bin) || bin.includes(api.sep) || (platform === 'win32' && bin.includes('/'))) {
+  // Anything with a separator of either flavour is a path, checked as given —
+  // spawn does the same, and a Windows-shaped path handed to a POSIX lookup
+  // (doctor's own tests simulate one platform on another) must not be
+  // searched on PATH as if it were a bare name.
+  if (win32.isAbsolute(bin) || posix.isAbsolute(bin) || bin.includes('/') || bin.includes('\\')) {
     return exists(bin) ? { path: bin, launchable: !shim(bin) } : null;
   }
   const hit = findOnPath(candidateNames(bin, platform), { env, exists, platform });

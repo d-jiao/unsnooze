@@ -36,6 +36,9 @@ test('resolveBin: paths are checked as given, bare names searched, shims marked 
   assert.deepEqual(resolveBin('claude', { env: { PATH: '/usr/bin' }, exists, platform: 'linux' }), { path: '/usr/bin/claude', launchable: true });
   assert.equal(resolveBin('claude', { env: { PATH: '/opt' }, exists, platform: 'linux' }), null);
   assert.equal(resolveBin('/nope/claude', { env: {}, exists, platform: 'linux' }), null);
+  // A path of the other platform's shape is still a path, never a PATH search.
+  assert.deepEqual(resolveBin('C:\\x\\codex.exe', { env: { PATH: '/usr/bin' }, exists, platform: 'linux' }), { path: 'C:\\x\\codex.exe', launchable: true });
+  assert.deepEqual(resolveBin('/usr/bin/claude', { env: { PATH: 'C:\\npm' }, exists, platform: 'win32' }), { path: '/usr/bin/claude', launchable: true });
   assert.equal(resolveBin('', { env: {}, exists }), null);
   assert.equal(resolveBin(null, { env: {}, exists }), null);
 });
