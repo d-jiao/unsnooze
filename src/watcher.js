@@ -23,7 +23,7 @@ import {
 import { getMultiplexer } from './multiplexer.js';
 import { parseTranscriptLine } from './watchers/claude.js';
 import { parseRolloutLines, rolloutMeta } from './watchers/codex.js';
-import { ROLLOUT_RE } from './agents/codex.js';
+import { ROLLOUT_RE, rolloutId } from './agents/codex.js';
 import { parseResetTime, resetAtMs } from './time-parser.js';
 import { upsertSession, readState, updateState } from './state.js';
 import { getConfig } from './settings.js';
@@ -101,8 +101,9 @@ export function codexSource({ roots }) {
         timestampMs: last.timestampMs,
       }];
     },
-    usage(lines) {
-      return lines.map(extractCodexUsage).filter(Boolean);
+    usage(lines, path) {
+      const rollout = rolloutId(path);
+      return lines.map(line => extractCodexUsage(line, { rollout })).filter(Boolean);
     },
   };
 }

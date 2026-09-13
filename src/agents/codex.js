@@ -11,7 +11,7 @@
 // the overload path, never the ledger.
 
 import { openSync, readSync, closeSync, readdirSync, statSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { CODEX_DIR } from '../config.js';
 
 // Since the 2026 unified ChatGPT desktop app absorbed the Codex app, the codex
@@ -67,6 +67,14 @@ export const patterns = {
 // null (the resumer then uses `codex resume --last`, which codex itself scopes
 // to the launch cwd).
 export const ROLLOUT_RE = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+
+// The thread uuid a rollout path names, or null for anything else. Cheaper than
+// rolloutMeta() (no read) and the same id in every rollout seen so far.
+export function rolloutId(path) {
+  if (typeof path !== 'string') return null;
+  const m = basename(path).match(ROLLOUT_RE);
+  return m ? m[1].toLowerCase() : null;
+}
 
 function fileHead(path, bytes = 4096) {
   let fd;
