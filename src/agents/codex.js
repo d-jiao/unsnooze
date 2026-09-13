@@ -13,6 +13,7 @@
 import { openSync, readSync, closeSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { CODEX_DIR } from '../config.js';
+import { findOnPath } from '../which.js';
 
 // Since the 2026 unified ChatGPT desktop app absorbed the Codex app, the codex
 // binary ships INSIDE the app bundle and many machines have no standalone
@@ -21,15 +22,53 @@ import { CODEX_DIR } from '../config.js';
 // codex-cli 0.144 from ChatGPT.app).
 export const CHATGPT_CODEX_BIN = '/Applications/ChatGPT.app/Contents/Resources/codex';
 
-function codexOnPath(env = process.env) {
-  return (env.PATH || '').split(':').some(dir => {
-    try { return dir && existsSync(join(dir, 'codex')); } catch { return false; }
-  });
+// Windows keeps the Desktop/Store install's CLI under a versioned runtime
+// directory — %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe — whose name
+// changes on every update. The interactive shell finds it through a PATH the
+// app rewrote; a daemon started at logon keeps the PATH it was born with,
+// which after an update names a directory that no longer exists (#25). So
+// look the directory up at launch time and take the newest runtime, the way
+// CHATGPT_CODEX_BIN covers the macOS bundle. Layout as reported by the
+// issue's Microsoft Store install; a machine without it just gets null.
+export function windowsBundledCodex({ env = process.env, readdir = readdirSync, stat = statSync } = {}) {
+  if (!env.LOCALAPPDATA) return null;
+  const base = join(env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin');
+  let entries;
+  try { entries = readdir(base, { withFileTypes: true }); } catch { return null; }
+  let best = null;
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const exe = join(base, e.name, 'codex.exe');
+    let mtime;
+    try { mtime = stat(exe).mtimeMs; } catch { continue; }
+    if (!best || mtime > best.mtime) best = { exe, mtime };
+  }
+  return best ? best.exe : null;
 }
 
-export function resolveCodexBin({ env = process.env, onPath = () => codexOnPath(env), exists = existsSync } = {}) {
+// What to spawn for codex. Order, on Windows: an explicit UNSNOOZE_CODEX_BIN,
+// a codex.exe on PATH (spawn resolves the bare name itself), the newest
+// Desktop/Store runtime, then a .cmd/.bat shim on PATH by full path — Node
+// refuses to spawn those without a shell, and a full path makes the launcher's
+// error say which file it was. Elsewhere: PATH, then the macOS app bundle.
+export function resolveCodexBin({
+  env = process.env,
+  platform = process.platform,
+  exists = existsSync,
+  onPath = null,
+  bundled = () => windowsBundledCodex({ env }),
+} = {}) {
   if (env.UNSNOOZE_CODEX_BIN) return env.UNSNOOZE_CODEX_BIN;
-  if (onPath()) return 'codex';
+  if (platform === 'win32') {
+    if (findOnPath(['codex.exe'], { env, exists, platform })) return 'codex';
+    const runtime = bundled();
+    if (runtime) return runtime;
+    const shim = findOnPath(['codex.cmd', 'codex.bat'], { env, exists, platform });
+    if (shim) return shim.path;
+    return 'codex';
+  }
+  const found = onPath ? onPath() : !!findOnPath(['codex'], { env, exists, platform });
+  if (found) return 'codex';
   if (exists(CHATGPT_CODEX_BIN)) return CHATGPT_CODEX_BIN;
   return 'codex';   // neither — the launcher degrades gracefully on spawn error
 }

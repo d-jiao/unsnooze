@@ -121,4 +121,57 @@ test('codex bin resolution falls back to the ChatGPT app bundle', async () => {
   assert.equal(resolveCodexBin({ env: {}, onPath: () => false, exists: p => p === CHATGPT_CODEX_BIN }), CHATGPT_CODEX_BIN);
   // neither → plain name so the launcher can degrade gracefully
   assert.equal(resolveCodexBin({ env: {}, onPath: () => false, exists: () => false }), 'codex');
+  // Explicitly non-win32: the platform decides the search, not the host.
+  assert.equal(resolveCodexBin({ env: { PATH: '/opt/bin:/usr/bin' }, platform: 'linux', exists: p => p === '/usr/bin/codex' }), 'codex');
+});
+
+// --- Windows (#25): PATH is ';'-separated, the CLI is codex.exe, and the
+// Desktop/Store install keeps it under a versioned runtime directory that a
+// daemon's logon-time PATH stops describing after the first update. ---
+
+test('windows codex resolution: exe on PATH, then the newest bundled runtime, then a shim by full path', async () => {
+  const { resolveCodexBin } = await import('../src/agents/codex.js');
+  const win = (files, extra = {}) => resolveCodexBin({
+    platform: 'win32',
+    env: { PATH: 'C:\\Users\\me\\AppData\\Local\\OpenAI\\Codex\\bin\\old-hash;C:\\Program Files\\nodejs;C:\\Users\\me\\AppData\\Roaming\\npm', ...extra },
+    exists: p => files.includes(p),
+    bundled: () => extra.runtime ?? null,
+  });
+  // A ':' split of that PATH finds nothing; a ';' split finds the exe → bare name (spawn resolves .exe itself).
+  assert.equal(win(['C:\\Program Files\\nodejs\\codex.exe'], { runtime: 'C:\\x\\codex.exe' }), 'codex',
+    'a live exe on PATH must be found before the bundled runtime is consulted');
+  // The PATH entry is a dead runtime dir → the newest live runtime, by full path.
+  assert.equal(win([], { runtime: 'C:\\Users\\me\\AppData\\Local\\OpenAI\\Codex\\bin\\new-hash\\codex.exe' }),
+    'C:\\Users\\me\\AppData\\Local\\OpenAI\\Codex\\bin\\new-hash\\codex.exe');
+  // Only an npm .cmd shim: named in full, so the launcher's refusal says which file.
+  assert.equal(win(['C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd']),
+    'C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd');
+  // A live exe on PATH beats the bundled runtime; the env override beats everything.
+  assert.equal(win(['C:\\Program Files\\nodejs\\codex.exe'], { runtime: 'C:\\x\\codex.exe' }), 'codex');
+  assert.equal(win([], { UNSNOOZE_CODEX_BIN: 'D:\\tools\\codex.exe', runtime: 'C:\\x\\codex.exe' }), 'D:\\tools\\codex.exe');
+  assert.equal(win([]), 'codex');
+});
+
+test('windowsBundledCodex picks the newest <hash>/codex.exe under the Desktop install', async () => {
+  const { windowsBundledCodex } = await import('../src/agents/codex.js');
+  const { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const local = mkdtempSync(join(tmpdir(), 'unsnooze-localappdata-'));
+  try {
+    const bin = join(local, 'OpenAI', 'Codex', 'bin');
+    for (const [hash, ageMin] of [['aaaa1111', 60], ['bbbb2222', 5], ['cccc3333', 30]]) {
+      mkdirSync(join(bin, hash), { recursive: true });
+      writeFileSync(join(bin, hash, 'codex.exe'), '');
+      const t = new Date(Date.now() - ageMin * 60_000);
+      utimesSync(join(bin, hash, 'codex.exe'), t, t);
+    }
+    mkdirSync(join(bin, 'empty-runtime'));          // a dir with no exe is skipped
+    writeFileSync(join(bin, 'stray-file'), '');       // as is a file at that level
+    assert.equal(windowsBundledCodex({ env: { LOCALAPPDATA: local } }), join(bin, 'bbbb2222', 'codex.exe'));
+    assert.equal(windowsBundledCodex({ env: { LOCALAPPDATA: join(local, 'nowhere') } }), null);
+    assert.equal(windowsBundledCodex({ env: {} }), null);
+  } finally {
+    rmSync(local, { recursive: true, force: true });
+  }
 });
