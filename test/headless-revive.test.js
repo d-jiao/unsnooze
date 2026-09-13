@@ -91,3 +91,26 @@ test('the revive output is captured where a user can actually read it', async ()
   assert.match(readFileSync(log, 'utf-8'), /agent started/,
     'with no pane to scroll back through, the log is the only record');
 });
+
+// #25: every headless Codex revival used to run the TUI form, which exits 1
+// before touching the session ("stdin is not a terminal"). The seam that has
+// to hold is backendCanType(headless) → codex.resumeArgs(canType: false) →
+// argv, through the real resumer.
+test('a headless codex revive runs `exec resume`, not the TUI', async () => {
+  const record = join(DIR, 'argv-codex.txt');
+  const shim = join(DIR, 'fake-codex-launcher.sh');
+  writeFileSync(shim, `#!/bin/sh\nprintf '%s\\n' "$@" > "${record}"\n`);
+  chmodSync(shim, 0o755);
+  const rec = seed({ agent: 'codex', sessionId: '019f56fe-3508-7f10-8bb2-5e1db403916f', detectedVia: 'transcript' });
+  const mux = createHeadless({ logDir: join(DIR, 'logs'), env: {} });
+
+  const result = await dispatchOne(rec, { mux, resolveMux: () => mux, selfCmd: [shim] });
+  assert.equal(result, 'reopen');
+  for (let i = 0; i < 40 && !existsSync(record); i++) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  const argv = readFileSync(record, 'utf-8').trim().split('\n');
+  assert.deepEqual(argv.slice(0, 5), ['_run', 'codex', 'exec', 'resume', '019f56fe-3508-7f10-8bb2-5e1db403916f'],
+    `revive argv was ${JSON.stringify(argv)}`);
+  assert.ok(argv[5] && argv[5].length > 0, 'the wake prompt rides in argv');
+});

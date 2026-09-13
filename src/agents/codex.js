@@ -125,9 +125,17 @@ export default {
   menu: null,                      // no interactive limit menu
   // Resume takes the prompt in argv — `codex resume <id> "msg"` starts the turn
   // immediately, nothing to type into the TUI.
-  resumeArgs(sessionId, message) {
+  //
+  // canType: false (headless — no pane): the TUI cannot run there at all. It
+  // refuses a non-TTY stdin before it looks at the session ("Error: stdin is
+  // not a terminal", exit 1 — reproduced against codex-cli 0.150 with the
+  // headless backend's exact stdio), so `codex exec resume <id> "msg"` carries
+  // the same conversation forward non-interactively instead (#25). With
+  // --last, codex reads a lone positional as the prompt, not a session id.
+  resumeArgs(sessionId, message, { canType = true } = {}) {
+    const tail = sessionId ? [sessionId, message] : ['--last', message];
     return {
-      args: sessionId ? ['resume', sessionId, message] : ['resume', '--last', message],
+      args: canType ? ['resume', ...tail] : ['exec', 'resume', ...tail],
       messageViaPane: false,
     };
   },

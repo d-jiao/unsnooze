@@ -62,6 +62,20 @@ test('codex resume args carry the message in argv', () => {
   assert.deepEqual(noId.args, ['resume', '--last', 'continue']);
 });
 
+// #25: the TUI exits 1 ("stdin is not a terminal") under the headless backend,
+// which then read the empty capture as a clean resume. Headless takes the
+// non-interactive subcommand; a real pane keeps the TUI form untouched.
+test('codex resumes headless through `exec resume`, never the TUI', () => {
+  const id = '0199a213-81c0-7800-8aa1-bbab2a035a53';
+  assert.deepEqual(codex.resumeArgs(id, 'continue', { canType: false }).args,
+    ['exec', 'resume', id, 'continue']);
+  assert.deepEqual(codex.resumeArgs(null, 'continue', { canType: false }).args,
+    ['exec', 'resume', '--last', 'continue']);
+  assert.deepEqual(codex.resumeArgs(id, 'continue', { canType: true }).args,
+    ['resume', id, 'continue']);
+  assert.equal(codex.resumeArgs(id, 'continue', { canType: false }).messageViaPane, false);
+});
+
 test('codex foreground command check', () => {
   assert.equal(codex.isForegroundCommand('codex'), true);
   assert.equal(codex.isForegroundCommand('zsh'), false);
