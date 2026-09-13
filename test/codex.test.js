@@ -113,14 +113,17 @@ test('"Try again later." yields no parse (fallback path)', () => {
 
 test('codex bin resolution falls back to the ChatGPT app bundle', async () => {
   const { resolveCodexBin, CHATGPT_CODEX_BIN } = await import('../src/agents/codex.js');
+  // The bundle is a macOS thing; pin the platform so the Windows runner does
+  // not take its own branch here.
+  const mac = opts => resolveCodexBin({ platform: 'darwin', ...opts });
   // env override always wins
-  assert.equal(resolveCodexBin({ env: { UNSNOOZE_CODEX_BIN: '/x/codex' }, onPath: () => true, exists: () => true }), '/x/codex');
+  assert.equal(mac({ env: { UNSNOOZE_CODEX_BIN: '/x/codex' }, onPath: () => true, exists: () => true }), '/x/codex');
   // codex on PATH → plain name (standalone CLI installs)
-  assert.equal(resolveCodexBin({ env: {}, onPath: () => true, exists: () => false }), 'codex');
+  assert.equal(mac({ env: {}, onPath: () => true, exists: () => false }), 'codex');
   // not on PATH but the unified ChatGPT app is installed → bundled binary
-  assert.equal(resolveCodexBin({ env: {}, onPath: () => false, exists: p => p === CHATGPT_CODEX_BIN }), CHATGPT_CODEX_BIN);
+  assert.equal(mac({ env: {}, onPath: () => false, exists: p => p === CHATGPT_CODEX_BIN }), CHATGPT_CODEX_BIN);
   // neither → plain name so the launcher can degrade gracefully
-  assert.equal(resolveCodexBin({ env: {}, onPath: () => false, exists: () => false }), 'codex');
+  assert.equal(mac({ env: {}, onPath: () => false, exists: () => false }), 'codex');
   // Explicitly non-win32: the platform decides the search, not the host.
   assert.equal(resolveCodexBin({ env: { PATH: '/opt/bin:/usr/bin' }, platform: 'linux', exists: p => p === '/usr/bin/codex' }), 'codex');
 });

@@ -296,6 +296,10 @@ function healthyDeps(over = {}) {
     hookInstalled: () => true,
     wrappersInstalled: () => true,
     platform: 'darwin',
+    // A resolvable agent: CI runners have no claude/codex, and the daemon-PATH
+    // findings under test must be the only thing deciding `healthy`.
+    agents: [{ id: 'claude', bin: process.execPath }],
+    enabled: () => true,
     ...over,
   };
 }
