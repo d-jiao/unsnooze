@@ -193,6 +193,7 @@ export function dispatchCandidate(c) {
         s.resetSource = source;
         if (bannerAt != null) s.bannerAt = bannerAt;
         if (c.limitType && c.limitType !== 'unknown') s.limitType = c.limitType;
+        if (c.reason) s.limitReason = c.reason;
       }
     });
     log(`refreshed reset for tracked stop: session=${c.sessionId} resetAt=${new Date(at).toISOString()}`);

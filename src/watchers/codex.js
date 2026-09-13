@@ -74,12 +74,15 @@ function parseSnapshot(entry, previous = null) {
   const exhausted = windows.filter(w => (w.used_percent ?? 0) >= 100);
   if (exhausted.length > 0) {
     binding = exhausted.reduce((a, b) => ((b.resets_at || 0) > (a.resets_at || 0) ? b : a));
-  } else if (workspaceWall(reachedType)) {
+  } else if (workspaceWall(reachedType) && windows.length > 0) {
     // Out of credits (or over the workspace cap) with no window exhausted:
     // there is no reset to sleep until. Record it the way a model limit is
     // recorded — no reset time, so the resumer probes and, at the ceiling,
     // makes the stall visible with the adapter's remedy instead of waking
     // into the same wall (#25 saw one of these scheduled as a 5h stop).
+    // Only from a snapshot that describes windows: a credits-only bucket
+    // (premium/null) carrying the reason must not re-file the 5h stop the
+    // account bucket recorded a moment earlier as a probe.
     return {
       limitType: 'model',
       resetAt: null,

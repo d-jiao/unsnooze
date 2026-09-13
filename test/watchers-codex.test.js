@@ -217,6 +217,20 @@ test('a workspace wall with no exhausted window has no reset to wait for', () =>
   }
 });
 
+test('a credits-only bucket carrying a workspace reason is not a stop of its own', () => {
+  // The account bucket's line, 0.6s earlier, already recorded the real stop;
+  // this one describes no window and must not re-file it as a probe.
+  const line = JSON.stringify({
+    timestamp: '2026-07-12T15:42:31.600Z', type: 'event_msg',
+    payload: { type: 'token_count', rate_limits: {
+      limit_id: 'premium', primary: null, secondary: null,
+      credits: { has_credits: false, unlimited: false, balance: '0' },
+      plan_type: 'business', rate_limit_reached_type: 'workspace_member_credits_depleted',
+    } },
+  });
+  assert.equal(parseRolloutLine(line), null);
+});
+
 test('an exhausted window still governs when a workspace reason rides along', () => {
   // #25: primary at 100 plus workspace_member_credits_depleted. The window
   // reset is what brings the plan allowance back — Codex itself reports this
