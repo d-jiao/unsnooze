@@ -244,6 +244,15 @@ the session files those surfaces already write:
   one minute by an empty `premium` bucket with no credits, using the previous
   future reset time. The snapshots must come from the same rollout; 99% alone
   is not a stop signal. This works across watcher polls and daemon restarts.
+  Since codex-cli 0.145 the failed turn's `task_complete` also carries the
+  limit error itself (`codex_error_info: "usage_limit_exceeded"` plus the
+  banner text), and unsnooze reads that too — it is the only signal when
+  Codex runs behind an OpenAI-compatible proxy (`model_providers.<x>.base_url`),
+  where the rate-limit headers never reach Codex and every snapshot has empty
+  windows. The banner's time is parsed like a scraped pane; "Try again later."
+  takes the probe path. Reverted threads (the desktop app's edit/regenerate,
+  `/undo`) continue in `rollout-<ts>-<thread id>_<rollout id>.jsonl`; those
+  files are watched and resumed by the stable thread id.
 - **Claude desktop (cowork) sessions** *(experimental, macOS)* run in
   sandboxes under `~/Library/Application Support/Claude`; unsnooze watches
   those too and revives with the session's isolated `CLAUDE_CONFIG_DIR`

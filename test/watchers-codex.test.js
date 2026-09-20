@@ -1,13 +1,13 @@
-// Codex rollout-line parser: limit stops never reach rollout files as Error
-// events (not persisted), but every turn writes token_count events carrying a
-// rate_limits snapshot with used_percent + resets_at epochs. Fixture shapes
-// captured from a real ~/.codex/sessions rollout.
+// Codex rollout-line parser: every turn writes token_count events carrying a
+// rate_limits snapshot with used_percent + resets_at epochs, and (since
+// codex-cli 0.145) a failed turn's task_complete carries the error with the
+// banner text. Fixture shapes captured from real ~/.codex/sessions rollouts.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseRolloutLine, rolloutMeta } from '../src/watchers/codex.js';
+import { parseRolloutLine, parseRolloutLines, rolloutMeta } from '../src/watchers/codex.js';
 
 const DIR = mkdtempSync(join(tmpdir(), 'unsnooze-codex-watch-test-'));
 after(() => rmSync(DIR, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
@@ -187,4 +187,81 @@ test('non-window reached_type strings (workspace credit/limit variants) still bi
   assert.ok(c, 'reached_type must bind even when no window shows 100%');
   assert.equal(c.resetAt, 1786462931 * 1000, 'latest reset governs');
   assert.equal(c.reachedType, 'workspace_owner_usage_limit_reached');
+});
+
+// --- persisted task_complete errors (codex-cli ≥ 0.145) ---
+// Verbatim from a ChatGPT desktop app rollout. Behind an OpenAI-compatible
+// proxy (model_providers.<x>.base_url) this is the only stop signal: the
+// X-Codex-* headers never reach Codex, so every snapshot has null windows.
+
+const STOPPED_AT = '2026-07-23T18:50:34.917Z';
+const LIMIT_MESSAGE = "You've hit your usage limit. To get more access now, send a request to your admin or try again at Jul 30th, 2026 10:33 AM.";
+
+function taskCompleteLine(error, at = STOPPED_AT) {
+  return JSON.stringify({
+    timestamp: at, type: 'event_msg',
+    payload: { type: 'task_complete', turn_id: '019f9050-ae37-74b1-944d-1dc075dbc91e',
+      last_agent_message: null, error, started_at: 1784832634, completed_at: 1784832634, duration_ms: 492 },
+  });
+}
+
+test('task_complete usage_limit_exceeded → stop carrying the banner as resetLine', () => {
+  const c = parseRolloutLine(taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' }));
+  assert.ok(c);
+  assert.equal(c.resetAt, null, 'no epoch in the error — the time-parser dates it downstream');
+  assert.equal(c.resetLine, LIMIT_MESSAGE);
+  assert.equal(c.limitType, 'unknown');
+  assert.equal(c.reachedType, null);
+  assert.equal(c.timestampMs, Date.parse(STOPPED_AT));
+});
+
+test('the banner alone qualifies without the marker; the marker alone qualifies without a parseable banner', () => {
+  const textOnly = parseRolloutLine(taskCompleteLine({ message: "You've hit your usage limit. Try again at 3:51 PM." }));
+  assert.equal(textOnly?.resetLine, "You've hit your usage limit. Try again at 3:51 PM.");
+  const markerOnly = parseRolloutLine(taskCompleteLine({ message: 'Usage limit reached.', codex_error_info: 'usage_limit_exceeded' }));
+  assert.ok(markerOnly, 'structured marker is authoritative');
+  assert.equal(markerOnly.resetLine, 'Usage limit reached.');   // unparseable → probe fallback downstream
+  assert.equal(markerOnly.limitType, 'unknown');
+});
+
+test('other task_complete outcomes are not stops', () => {
+  const bare429 = { message: 'exceeded retry limit, last status: 429 Too Many Requests',
+    codex_error_info: { response_too_many_failed_attempts: { http_status_code: 429 } } };
+  assert.equal(parseRolloutLine(taskCompleteLine(bare429)), null,
+    'a bare 429 has no reset time — the pane path files it under overload for the same reason');
+  assert.equal(parseRolloutLine(taskCompleteLine({ message: 'stream disconnected before completion' })), null);
+  assert.equal(parseRolloutLine(taskCompleteLine({ message: 'Server is temporarily limiting requests (not your usage limit)' })), null);
+  assert.equal(parseRolloutLine(taskCompleteLine(null)), null);
+  assert.equal(parseRolloutLine(JSON.stringify({ timestamp: TS, type: 'event_msg',
+    payload: { type: 'task_complete', last_agent_message: 'done' } })), null);
+});
+
+test('the same turn\'s exhausted snapshot lends its exact epoch to the error', () => {
+  const snapshot = tokenCountLine(rateLimits({ primary: { used_percent: 100, window_minutes: 300, resets_at: RESETS_PRIMARY } }));
+  const soon = taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' }, '2026-05-13T06:37:11.000Z');
+  const hits = parseRolloutLines([snapshot, soon]);
+  assert.equal(hits.length, 2);
+  assert.equal(hits[1].resetAt, RESETS_PRIMARY * 1000, 'epoch beats the banner\'s minute precision');
+  assert.equal(hits[1].limitType, '5h');
+  assert.equal(hits[1].resetLine, LIMIT_MESSAGE);
+  // An hour later the snapshot is stale: it must not date an unrelated stop.
+  const late = taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' }, '2026-05-13T07:37:11.000Z');
+  assert.equal(parseRolloutLines([snapshot, late])[1].resetAt, null);
+});
+
+test('behind a proxy every snapshot has null windows and only the error dates the stop', () => {
+  const proxied = tokenCountLine({ limit_id: 'codex', limit_name: null, primary: null, secondary: null,
+    credits: null, individual_limit: null, spend_control_reached: null, plan_type: null, rate_limit_reached_type: null });
+  assert.equal(parseRolloutLine(proxied), null);
+  const hits = parseRolloutLines([proxied, taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' })]);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].resetAt, null);
+  assert.equal(hits[0].resetLine, LIMIT_MESSAGE);
+});
+
+test('rolloutMeta on a reverted-thread filename falls back to the thread id, not the rollout id', () => {
+  const thread = '01a0bcf8-f716-7ac3-b90b-5a2cede549a1';
+  const path = join(DIR, `rollout-2026-09-20T14-49-02-${thread}_01a0c026-7b2f-74c3-b576-76743e1da8d7.jsonl`);
+  writeFileSync(path, 'garbage not json\n');
+  assert.equal(rolloutMeta(path).sessionId, thread);
 });

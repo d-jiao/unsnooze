@@ -35,7 +35,7 @@ export function resolveCodexBin({ env = process.env, onPath = () => codexOnPath(
 }
 
 const LIMIT_ANCHORS = [
-  /You've hit your usage limit/i,
+  /You['’]ve hit your usage limit/i,   // the desktop app also emits a curly apostrophe
   /Your workspace is out of credits/i,
   /hit your spend cap/i,
 ];
@@ -62,11 +62,18 @@ export const patterns = {
   transientPatterns: [/stream error/i, /exceeded retry limit/i],
 };
 
-// Sessions live in ~/.codex/sessions/YYYY/MM/DD/rollout-{ts}-{UUID}.jsonl;
+// Sessions live in ~/.codex/sessions/YYYY/MM/DD/rollout-{ts}-{THREAD}.jsonl;
 // the first JSONL line carries the session cwd. Conservative: no cwd match →
 // null (the resumer then uses `codex resume --last`, which codex itself scopes
 // to the launch cwd).
-export const ROLLOUT_RE = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+//
+// A reverted thread (the desktop app's edit/regenerate, `/undo`) continues in
+// rollout-{ts}-{THREAD}_{ROLLOUT}.jsonl — codex-rs/rollout/src/rollout_file_name.rs:
+// "filenames for reverted threads append an underscore and a distinct rollout
+// ID after the stable thread ID". Group 1 is always the thread id, which is
+// the id `codex resume` takes; the rollout id after the underscore is not.
+const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+export const ROLLOUT_RE = new RegExp(`^rollout-.*-(${UUID})(?:_${UUID})?\\.jsonl$`, 'i');
 
 function fileHead(path, bytes = 4096) {
   let fd;

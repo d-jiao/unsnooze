@@ -1,20 +1,39 @@
 // Codex rollout watcher: parses lines appended to session rollout files
 // (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl) into limit-stop candidates.
 //
-// Codex never persists Error/StreamError events to rollouts (confirmed in
-// codex-rs/rollout policy), so the limit banner text is NOT in the file. What
-// IS persisted is a token_count event per turn carrying a rate_limits
-// snapshot — used_percent per window plus an exact resets_at epoch:
-//   {"type":"event_msg","payload":{"type":"token_count","rate_limits":{
-//     "primary":{"used_percent":100,"window_minutes":300,"resets_at":1778672230},
-//     "secondary":{"used_percent":1,"window_minutes":10080,"resets_at":...},
-//     "rate_limit_reached_type":null}}}
-// That epoch is more precise than any scraped banner, and rollouts are shared
-// by every Codex surface (CLI, IDE extension, desktop app).
+// Two signals are persisted, and either one is a stop:
+//
+// 1. A token_count event per turn carrying a rate_limits snapshot —
+//    used_percent per window plus an exact resets_at epoch:
+//      {"type":"event_msg","payload":{"type":"token_count","rate_limits":{
+//        "primary":{"used_percent":100,"window_minutes":300,"resets_at":1778672230},
+//        "secondary":{"used_percent":1,"window_minutes":10080,"resets_at":...},
+//        "rate_limit_reached_type":null}}}
+//    That epoch is more precise than any scraped banner, so it governs
+//    whenever it is present.
+//
+// 2. Since codex-cli 0.145 the failed turn's task_complete carries the
+//    error itself, with the same banner text the TUI renders:
+//      {"type":"event_msg","payload":{"type":"task_complete","error":{
+//        "message":"You've hit your usage limit. … try again at Jul 30th, 2026 10:33 AM.",
+//        "codex_error_info":"usage_limit_exceeded"}}}
+//    This is the ONLY signal when Codex runs behind an OpenAI-compatible
+//    proxy (model_providers.<x>.base_url): the proxy answers with its own
+//    response, the X-Codex-* rate-limit headers never reach Codex, and every
+//    snapshot arrives as {primary:null, secondary:null}. The message goes
+//    through the same time-parser as a scraped pane, so the reset lands on
+//    the banner's own clock time (or the probe fallback for "Try again later.").
+//
+// Rollouts are shared by every Codex surface (CLI, IDE extension, desktop app).
+// A bare 429 ("exceeded retry limit, last status: 429 Too Many Requests",
+// codex_error_info.response_too_many_failed_attempts) is NOT a stop here —
+// it carries no reset time, and the pane path files it under transient
+// overload for the same reason.
 
 import { openSync, readSync, closeSync } from 'node:fs';
 import { basename } from 'node:path';
-import { ROLLOUT_RE } from '../agents/codex.js';
+import { ROLLOUT_RE, patterns as codexPatterns } from '../agents/codex.js';
+import { detectLimit } from '../patterns.js';
 // Usage extractor lives in usage.js (shared cold path + daemon); re-exported
 // here so the plan's watcher surface is the documented import site.
 export { extractCodexUsage } from '../usage.js';
@@ -31,6 +50,34 @@ function rolloutSnapshot(line) {
   const rl = entry.payload.rate_limits;
   if (!rl || typeof rl !== 'object') return null;
   return entry;
+}
+
+// The failed turn's task_complete error, when it is a usage limit. Only the
+// structured marker or the verbatim banner qualifies: the turn also ends in
+// task_complete for stream errors, retry exhaustion and cancellations.
+function rolloutLimitError(line) {
+  if (!line || !line.trim()) return null;
+  let entry;
+  try { entry = JSON.parse(line); } catch { return null; }
+  if (entry?.type !== 'event_msg' || entry.payload?.type !== 'task_complete') return null;
+  const error = entry.payload.error;
+  if (!error || typeof error !== 'object') return null;
+  const message = typeof error.message === 'string' ? error.message.trim() : '';
+  const info = error.codex_error_info;
+  const structured = info === 'usage_limit_exceeded'
+    || (info && typeof info === 'object' && 'usage_limit_exceeded' in info);
+  // One line of pane text, same anchors and same reset-line selection as
+  // the scraped TUI — so the two paths cannot disagree about a banner.
+  const detected = message ? detectLimit(message, 1, codexPatterns) : { hit: false, limitType: null, resetLine: null };
+  if (!structured && !detected.hit) return null;
+  const ts = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+  return {
+    limitType: detected.hit ? detected.limitType : 'unknown',
+    resetAt: null,
+    resetLine: detected.resetLine || message || null,
+    reachedType: null,
+    timestampMs: Number.isFinite(ts) ? ts : null,
+  };
 }
 
 function emptyPremium(rl) {
@@ -91,7 +138,7 @@ function parseSnapshot(entry, previous = null) {
 }
 
 export function parseRolloutLine(line) {
-  return parseSnapshot(rolloutSnapshot(line));
+  return parseSnapshot(rolloutSnapshot(line)) || rolloutLimitError(line);
 }
 
 // Look immediately before the appended batch, not at the file's current EOF:
@@ -116,18 +163,40 @@ function previousSnapshot(path, offset) {
   return null;
 }
 
+// A snapshot stop and the task_complete error of the same turn describe one
+// event: keep the epoch (exact) and let the banner only fill in what the
+// snapshot lacks. Bound the pairing to the same batch and a short window so a
+// stale exhausted snapshot never lends its epoch to a later, unrelated stop.
+const SNAPSHOT_PAIR_WINDOW_MS = 5 * 60_000;
+
 export function parseRolloutLines(lines, { path, offset } = {}) {
   let previous;
+  let lastSnapshotHit = null;
   const hits = [];
   for (const line of lines) {
     const snapshot = rolloutSnapshot(line);
-    if (!snapshot) continue;
-    if (previous === undefined && emptyPremium(snapshot.payload.rate_limits)) {
-      previous = previousSnapshot(path, offset);
+    if (snapshot) {
+      if (previous === undefined && emptyPremium(snapshot.payload.rate_limits)) {
+        previous = previousSnapshot(path, offset);
+      }
+      const hit = parseSnapshot(snapshot, previous);
+      if (hit) { hits.push(hit); lastSnapshotHit = hit; }
+      previous = snapshot;
+      continue;
     }
-    const hit = parseSnapshot(snapshot, previous);
-    if (hit) hits.push(hit);
-    previous = snapshot;
+    const error = rolloutLimitError(line);
+    if (!error) continue;
+    const paired = lastSnapshotHit
+      && lastSnapshotHit.resetAt
+      && Number.isFinite(error.timestampMs) && Number.isFinite(lastSnapshotHit.timestampMs)
+      && error.timestampMs >= lastSnapshotHit.timestampMs
+      && error.timestampMs - lastSnapshotHit.timestampMs <= SNAPSHOT_PAIR_WINDOW_MS;
+    if (paired) {
+      error.resetAt = lastSnapshotHit.resetAt;
+      if (error.limitType === 'unknown') error.limitType = lastSnapshotHit.limitType;
+      error.reachedType = lastSnapshotHit.reachedType;
+    }
+    hits.push(error);
   }
   return hits;
 }

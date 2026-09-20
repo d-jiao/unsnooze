@@ -95,7 +95,9 @@ export function codexSource({ roots }) {
         sessionId: meta.sessionId,
         cwd: meta.cwd,
         limitType: last.limitType,
-        resetLine: null,
+        // Banner text from a persisted task_complete error; parsed by
+        // dispatchCandidate exactly like a scraped pane when no epoch is known.
+        resetLine: last.resetLine || null,
         resetAt: last.resetAt,
         origin: meta.originator,
         timestampMs: last.timestampMs,
