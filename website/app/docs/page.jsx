@@ -114,7 +114,10 @@ unsnooze doctor: all clear — install is healthy.
                 <li>Into a fresh workspace; cmux has no joinable named-session model.</li>
                 <li>As a detached process. Its output goes to{' '}
                   <C>~/.unsnooze/headless/&lt;session&gt;.log</C>, since there is no scrollback to
-                  read it out of later.</li>
+                  read it out of later; the prompt rides in argv (<C>claude --resume &lt;id&gt; "…"</C>,{' '}
+                  <C>codex exec resume &lt;id&gt; "…"</C>), and a revival that exits non-zero is
+                  retried, with its last output as the <C>last error</C> in{' '}
+                  <C>unsnooze status</C>.</li>
                 <li>Nothing to wrap into — your own terminal is the session.</li>
               </ol>
               <p><strong>Install:</strong> <C>brew install tmux</C> or <C>brew install zellij</C> on

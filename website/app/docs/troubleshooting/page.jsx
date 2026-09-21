@@ -103,6 +103,19 @@ export default function TroubleshootingDocsPage() {
                   five-hour snapshot followed by an empty <C>premium</C> bucket with no credits
                   in the same rollout, then schedules the session using the previous reset
                   time. A 99% reading alone is not a stop signal.</li>
+                <li><strong>Codex behind a proxy never stopped.</strong> Through an
+                  OpenAI-compatible proxy the rate-limit headers never reach Codex, so its
+                  snapshots are empty. From v1.19.1 unsnooze also reads the limit error Codex
+                  writes when the turn fails (codex-cli 0.145 or later) and dates the stop from
+                  its banner.</li>
+                <li><strong>A headless revival died.</strong> Without a multiplexer (native
+                  Windows, a bare server) a revival that exits non-zero is retried, and{' '}
+                  <C>unsnooze status</C> shows its own last words as the <C>last error</C> —{' '}
+                  <C>spawn codex ENOENT</C> means the daemon cannot find the agent.{' '}
+                  <C>unsnooze doctor</C> prints the binary each agent resolves to. On Windows
+                  the daemon keeps the <C>PATH</C> it had at logon: set{' '}
+                  <C>UNSNOOZE_CODEX_BIN</C> (or <C>UNSNOOZE_CLAUDE_BIN</C>, …) to the agent's{' '}
+                  <C>.exe</C>, or restart the Scheduled Task after an agent update.</li>
                 <li><strong>It was recorded but never woke.</strong> A wake problem, and{' '}
                   <C>unsnooze preview &lt;id&gt;</C> names the reason rather than guessing. The
                   usual answers are a guard deliberately holding it — see{' '}

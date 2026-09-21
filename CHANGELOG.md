@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.19.1 — 2026-09-13
+## 1.19.1 — 2026-09-21
 
 A Codex usage reading that was averaged down, a headless Codex revival
 that could never have worked — reported as a success — and Codex stops that
