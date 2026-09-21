@@ -103,3 +103,32 @@ test('a revive inherits launchExtraArgs, so --autocompact survives the wake', ()
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout, '--autocompact 400000 --resume abc-123 carry on\n');
 });
+
+// #25: the launcher's failure line is what the resumer reads back out of the
+// headless log when a revival dies, so it has to say what was launched and
+// why it failed — and exit non-zero, so the recorded exit is a failure.
+test('a binary that cannot be launched exits 127 and names itself and the reason', () => {
+  const r = run({ UNSNOOZE_MULTIPLEXER: 'headless', UNSNOOZE_CODEX_BIN: join(DIR, 'nowhere', 'codex') },
+    ['_run', 'codex', 'resume', '--last', 'hey']);
+  assert.equal(r.status, 127);
+  assert.match(r.stderr, /unsnooze: failed to launch .*codex: spawn .* ENOENT/);
+});
+
+test('a .cmd/.bat shim that cannot be launched says which env var to point at the .exe', () => {
+  const r = run({ UNSNOOZE_MULTIPLEXER: 'headless', UNSNOOZE_CODEX_BIN: join(DIR, 'nowhere', 'codex.cmd') },
+    ['_run', 'codex', 'resume', '--last', 'hey']);
+  assert.equal(r.status, 127);
+  assert.match(r.stderr, /codex\.cmd is a \.cmd\/\.bat shim/);
+  assert.match(r.stderr, /UNSNOOZE_CODEX_BIN at the \.exe/);
+});
+
+// A resumer spawned by the StopFailure hook inherits UNSNOOZE_ACTIVE=1 from
+// claude's environment, so a revival's launcher took the pass-through branch —
+// where a binary that could not start came back as a bare exit 1, and the
+// resumer's lastError could say no more than "(exit 1)".
+test('the pass-through branch names a binary it could not start, and exits 127', () => {
+  const r = run({ UNSNOOZE_ACTIVE: '1', UNSNOOZE_CODEX_BIN: join(DIR, 'nowhere', 'codex') },
+    ['_run', 'codex', 'exec', 'resume', '--last', 'hey']);
+  assert.equal(r.status, 127);
+  assert.match(r.stderr, /unsnooze: failed to launch .*codex: spawn(Sync)? .* ENOENT/);
+});
