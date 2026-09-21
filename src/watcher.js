@@ -90,14 +90,16 @@ export function codexSource({ roots }) {
     parse(lines, path, { offset } = {}) {
       const hits = parseRolloutLines(lines, { path, offset });
       if (hits.length === 0) return [];
-      const last = hits[hits.length - 1];   // the latest snapshot governs
+      const last = hits[hits.length - 1];   // the latest snapshot or limit error governs
       const meta = rolloutMeta(path);
       return [{
         agent: 'codex',
         sessionId: meta.sessionId,
         cwd: meta.cwd,
         limitType: last.limitType,
-        resetLine: null,
+        // Banner text from a persisted task_complete error; parsed by
+        // dispatchCandidate exactly like a scraped pane when no epoch is known.
+        resetLine: last.resetLine || null,
         resetAt: last.resetAt,
         reason: last.reachedType || null,
         origin: meta.originator,

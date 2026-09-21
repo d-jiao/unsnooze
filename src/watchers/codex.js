@@ -1,20 +1,39 @@
 // Codex rollout watcher: parses lines appended to session rollout files
 // (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl) into limit-stop candidates.
 //
-// Codex never persists Error/StreamError events to rollouts (confirmed in
-// codex-rs/rollout policy), so the limit banner text is NOT in the file. What
-// IS persisted is a token_count event per turn carrying a rate_limits
-// snapshot — used_percent per window plus an exact resets_at epoch:
-//   {"type":"event_msg","payload":{"type":"token_count","rate_limits":{
-//     "primary":{"used_percent":100,"window_minutes":300,"resets_at":1778672230},
-//     "secondary":{"used_percent":1,"window_minutes":10080,"resets_at":...},
-//     "rate_limit_reached_type":null}}}
-// That epoch is more precise than any scraped banner, and rollouts are shared
-// by every Codex surface (CLI, IDE extension, desktop app).
+// Two signals are persisted, and either one is a stop:
+//
+// 1. A token_count event per turn carrying a rate_limits snapshot —
+//    used_percent per window plus an exact resets_at epoch:
+//      {"type":"event_msg","payload":{"type":"token_count","rate_limits":{
+//        "primary":{"used_percent":100,"window_minutes":300,"resets_at":1778672230},
+//        "secondary":{"used_percent":1,"window_minutes":10080,"resets_at":...},
+//        "rate_limit_reached_type":null}}}
+//    That epoch is more precise than any scraped banner, so it governs
+//    whenever it is present.
+//
+// 2. Since codex-cli 0.145 the failed turn's task_complete carries the
+//    error itself, with the same banner text the TUI renders:
+//      {"type":"event_msg","payload":{"type":"task_complete","error":{
+//        "message":"You've hit your usage limit. … try again at Jul 30th, 2026 10:33 AM.",
+//        "codex_error_info":"usage_limit_exceeded"}}}
+//    This is the ONLY signal when Codex runs behind an OpenAI-compatible
+//    proxy (model_providers.<x>.base_url): the proxy answers with its own
+//    response, the X-Codex-* rate-limit headers never reach Codex, and every
+//    snapshot arrives as {primary:null, secondary:null}. The message goes
+//    through the same time-parser as a scraped pane, so the reset lands on
+//    the banner's own clock time (or the probe fallback for "Try again later.").
+//
+// Rollouts are shared by every Codex surface (CLI, IDE extension, desktop app).
+// A bare 429 ("exceeded retry limit, last status: 429 Too Many Requests",
+// codex_error_info.response_too_many_failed_attempts) is NOT a stop here —
+// it carries no reset time, and the pane path files it under transient
+// overload for the same reason.
 
 import { openSync, readSync, closeSync } from 'node:fs';
 import { basename } from 'node:path';
-import { ROLLOUT_RE } from '../agents/codex.js';
+import { ROLLOUT_RE, patterns as codexPatterns } from '../agents/codex.js';
+import { detectLimit } from '../patterns.js';
 // Usage extractor lives in usage.js (shared cold path + daemon); re-exported
 // here so the plan's watcher surface is the documented import site.
 export { extractCodexUsage } from '../usage.js';
@@ -31,6 +50,51 @@ function rolloutSnapshot(line) {
   const rl = entry.payload.rate_limits;
   if (!rl || typeof rl !== 'object') return null;
   return entry;
+}
+
+// The failed turn's task_complete error, when it is a usage limit. The turn
+// also ends in task_complete for stream errors, retry exhaustion and
+// cancellations, so only the banner itself qualifies — not the structured
+// marker alone: codex-rs (protocol/src/error.rs, to_codex_protocol_error)
+// sends codex_error_info "usage_limit_exceeded" for "Quota exceeded. Check
+// your plan and billing details." and "To use Codex with your ChatGPT plan,
+// upgrade to Plus…" too, which no amount of waiting clears. Every real usage
+// limit it words ("You’ve hit your usage limit…", "Your workspace is out of
+// credits…", "You hit your spend cap…") carries a banner anchor.
+// codex-rs words the workspace walls (UsageLimitReachedError's Display):
+// "Your workspace is out of credits. …" and "You hit your spend cap set …".
+const WORKSPACE_WALL_BANNER = /Your workspace is out of credits|hit your spend cap/i;
+
+function rolloutLimitError(line) {
+  // Every line that is not a snapshot lands here, and rollout lines can be
+  // large (tool output): skip the second JSON.parse unless it can be a match.
+  if (!line || !line.includes('"task_complete"')) return null;
+  let entry;
+  try { entry = JSON.parse(line); } catch { return null; }
+  if (entry?.type !== 'event_msg' || entry.payload?.type !== 'task_complete') return null;
+  const error = entry.payload.error;
+  if (!error || typeof error !== 'object') return null;
+  const message = typeof error.message === 'string' ? error.message.trim() : '';
+  if (!message) return null;
+  // The message as pane text, with the same anchors and the same reset-line
+  // selection as the scraped TUI — so the two paths cannot disagree about a
+  // banner. All of it (tail 0): a message that wraps its reset time onto a
+  // second line must still be read whole.
+  const detected = detectLimit(message, 0, codexPatterns);
+  if (!detected.hit) return null;
+  const ts = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+  // A workspace wall says what it is in words, with no time to try again at.
+  // Behind a proxy no snapshot is there to classify it, so the banner files
+  // it the way parseSnapshot files a workspace reason with no spent window:
+  // a model limit — probed, then held for a human, never woken into.
+  const wall = WORKSPACE_WALL_BANNER.test(message);
+  return {
+    limitType: wall ? 'model' : detected.limitType,
+    resetAt: null,
+    resetLine: wall ? null : (detected.resetLine || message),
+    reachedType: null,
+    timestampMs: Number.isFinite(ts) ? ts : null,
+  };
 }
 
 function emptyPremium(rl) {
@@ -76,6 +140,9 @@ function parseSnapshot(entry, previous = null) {
     .map(k => rl[k])
     .filter(w => w && typeof w === 'object');
   let binding = null;
+  // The rate-limit bucket the binding window belongs to (Codex defaults a
+  // missing limit_id to "codex"). parseRolloutLines pairs errors by it.
+  let bucket = rl.limit_id ?? 'codex';
   const exhausted = windows.filter(w => (w.used_percent ?? 0) >= 100);
   if (exhausted.length > 0) {
     binding = exhausted.reduce((a, b) => ((b.resets_at || 0) > (a.resets_at || 0) ? b : a));
@@ -101,6 +168,7 @@ function parseSnapshot(entry, previous = null) {
         resetAt: null,
         reachedType,
         timestampMs: Number.isFinite(ts) ? ts : null,
+        bucket,
       };
     }
   } else if (reachedType) {
@@ -119,6 +187,7 @@ function parseSnapshot(entry, previous = null) {
         && Number.isFinite(primary.used_percent) && primary.used_percent >= 99
         && Number.isFinite(primary.resets_at) && primary.resets_at * 1000 > ts) {
       binding = primary;
+      bucket = prior.limit_id;
       const secondary = prior.secondary;
       if (Number.isFinite(secondary?.used_percent) && secondary.used_percent >= 100
           && Number.isFinite(secondary.resets_at) && secondary.resets_at > binding.resets_at) {
@@ -133,11 +202,12 @@ function parseSnapshot(entry, previous = null) {
     resetAt: binding.resets_at ? binding.resets_at * 1000 : null,
     reachedType,
     timestampMs: Number.isFinite(ts) ? ts : null,
+    bucket,
   };
 }
 
 export function parseRolloutLine(line) {
-  return parseSnapshot(rolloutSnapshot(line));
+  return parseSnapshot(rolloutSnapshot(line)) || rolloutLimitError(line);
 }
 
 // Look immediately before the appended batch, not at the file's current EOF:
@@ -162,18 +232,68 @@ function previousSnapshot(path, offset) {
   return null;
 }
 
+// A snapshot stop and the task_complete error of the same turn describe one
+// event: keep the epoch (exact) and let the banner only fill in what the
+// snapshot lacks. Bound the pairing to the same batch and a short window so a
+// stale exhausted snapshot never lends its epoch to a later, unrelated stop —
+// and to a stop that still stands when the error is written: its epoch must
+// not have passed yet, and no later reading of the same bucket may show it
+// cleared. Only the same bucket: Codex writes one token_count line per
+// rate-limit bucket per response, so a healthy `codex_other` line right after
+// an exhausted account line says nothing about the account.
+const SNAPSHOT_PAIR_WINDOW_MS = 5 * 60_000;
+
+function describesWindows(rl) {
+  return ['primary', 'secondary'].some(k => rl[k] && typeof rl[k] === 'object');
+}
+
 export function parseRolloutLines(lines, { path, offset } = {}) {
   let previous;
+  let lastSnapshotHit = null;
   const hits = [];
   for (const line of lines) {
     const snapshot = rolloutSnapshot(line);
-    if (!snapshot) continue;
-    if (previous === undefined && emptyPremium(snapshot.payload.rate_limits)) {
-      previous = previousSnapshot(path, offset);
+    if (snapshot) {
+      if (previous === undefined && emptyPremium(snapshot.payload.rate_limits)) {
+        previous = previousSnapshot(path, offset);
+      }
+      const hit = parseSnapshot(snapshot, previous);
+      if (hit) {
+        hits.push(hit);
+        lastSnapshotHit = hit;
+      } else if (lastSnapshotHit) {
+        const rl = snapshot.payload.rate_limits;
+        if ((rl.limit_id ?? 'codex') === lastSnapshotHit.bucket && describesWindows(rl)) {
+          lastSnapshotHit = null;
+        }
+      }
+      previous = snapshot;
+      continue;
     }
-    const hit = parseSnapshot(snapshot, previous);
-    if (hit) hits.push(hit);
-    previous = snapshot;
+    const error = rolloutLimitError(line);
+    if (!error) continue;
+    const stop = lastSnapshotHit;
+    const paired = stop
+      && Number.isFinite(error.timestampMs) && Number.isFinite(stop.timestampMs)
+      && error.timestampMs >= stop.timestampMs
+      && error.timestampMs - stop.timestampMs <= SNAPSHOT_PAIR_WINDOW_MS
+      // A workspace wall has no epoch to lend, and pairs anyway (below).
+      && (stop.resetAt ? stop.resetAt > error.timestampMs : stop.limitType === 'model');
+    if (paired) {
+      error.resetAt = stop.resetAt;
+      error.reachedType = stop.reachedType;
+      if (stop.limitType === 'model') {
+        // The snapshot already said what this is: a workspace wall (credits
+        // depleted, workspace cap) that no reset takes down. The banner must
+        // not turn it back into a waitable stop — probe, then hold for a
+        // human, exactly as parseSnapshot filed it.
+        error.limitType = 'model';
+        error.resetLine = null;
+      } else if (error.limitType === 'unknown') {
+        error.limitType = stop.limitType;
+      }
+    }
+    hits.push(error);
   }
   return hits;
 }

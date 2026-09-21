@@ -3,7 +3,7 @@
 // that changes them should fail here, loudly.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import codex from '../src/agents/codex.js';
+import codex, { ROLLOUT_RE } from '../src/agents/codex.js';
 import { getAgent } from '../src/agents/index.js';
 import { detectLimit, isBusy, overloadMatch } from '../src/patterns.js';
 import { parseResetTime, resetAtMs } from '../src/time-parser.js';
@@ -23,6 +23,7 @@ const VARIANTS = [
   "■ You've hit your usage limit. Try again later.",
   "■ You've hit your usage limit for gpt-5-codex. Switch to another model now, or try again at 4:10 PM.",
   "You've hit your usage limit. Try again in 4 days 20 hours 9 minutes.",
+  "You’ve hit your usage limit. To get more access now, send a request to your admin or try again at 7:36 AM.",   // curly apostrophe, from the desktop app
 ];
 
 for (const banner of VARIANTS) {
@@ -50,6 +51,23 @@ test('busy and idle markers', () => {
   const idle = '› Ask Codex to do anything\n\ngpt-5.6 default · /tmp/project\n';
   assert.equal(isBusy(idle, codex.patterns.busyPatterns), false);
   assert.equal(codex.patterns.idleRegex.test(idle), true);
+});
+
+// --- rollout filenames ---
+
+test('ROLLOUT_RE captures the thread id from plain and reverted-thread filenames', () => {
+  const thread = '01a0bcf8-f716-7ac3-b90b-5a2cede549a1';
+  const rollout = '01a0c026-7b2f-74c3-b576-76743e1da8d7';
+  assert.equal(`rollout-2026-09-20T00-00-27-${thread}.jsonl`.match(ROLLOUT_RE)?.[1], thread);
+  // codex-rs/rollout/src/rollout_file_name.rs: a reverted thread continues in
+  // "rollout-<ts>-<thread id>_<rollout id>.jsonl". The stable thread id is
+  // what `codex resume` takes — never the rollout id after the underscore.
+  assert.equal(`rollout-2026-09-20T14-49-02-${thread}_${rollout}.jsonl`.match(ROLLOUT_RE)?.[1], thread);
+  for (const name of [
+    `rollout-2026-09-20T14-49-02-${thread}_junk.jsonl`,
+    `rollout-2026-09-20T00-00-27-${thread}.jsonl.zst`,   // compressed archive, never appended
+    'notes.jsonl',
+  ]) assert.equal(ROLLOUT_RE.test(name), false, name);
 });
 
 // --- resume invocation ---

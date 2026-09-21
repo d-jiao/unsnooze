@@ -278,7 +278,12 @@ export function resetAtMs(parsed, {
       }
       return t;   // unreachable in practice — 9 steps cover a week + DST repeat
     }
-    if (t <= anchor) {
+    // A clock time names a whole minute. Codex prints the reset as %-I:%M and
+    // drops the seconds, so a dated banner written at 7:36:15 that says "try
+    // again at 7:36 AM" means a reset later in that same minute — not 7:36
+    // tomorrow, a day late. Only a minute that had fully passed rolls.
+    const past = bannerAt != null ? t + 60_000 <= anchor : t <= anchor;
+    if (past) {
       // Dated banner, or ambiguous (need both am/pm candidates as real
       // next-occurrences): roll to the next day. Undated non-ambiguous
       // past clock times stay past so the outer guard returns due-now

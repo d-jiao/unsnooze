@@ -2,8 +2,9 @@
 
 ## 1.19.1 — 2026-09-13
 
-A Codex usage reading that was averaged down, and a headless Codex revival
-that could never have worked — reported as a success.
+A Codex usage reading that was averaged down, a headless Codex revival
+that could never have worked — reported as a success — and Codex stops that
+were never seen at all behind a proxy or in a reverted thread.
 
 ### `unsnooze usage` reports Codex's exact percentage as read
 
@@ -95,6 +96,38 @@ The Windows resolution follows the layout in the report and wants a Windows
 run before it is trusted; continuing an open Codex Desktop thread in place
 (`codex queue`) is a separate follow-up. Thanks to
 [@nwn900](https://github.com/nwn900) for the precise report.
+
+### Codex stops behind a proxy, and in reverted threads
+
+[Issue #27](https://github.com/saaranshM/unsnooze/issues/27) found two ways
+a Codex desktop-app or IDE session went untracked:
+
+- **Reverted threads are watched.** An edited, regenerated or `/undo`-ed
+  thread continues in `rollout-<ts>-<thread id>_<rollout id>.jsonl`, a name
+  the rollout watcher never opened. Those files are now watched, counted by
+  `unsnooze usage`, and resumed by the stable thread id.
+- **A stop recorded only as an error is a stop.** Behind an OpenAI-compatible
+  proxy the rate-limit headers never reach Codex, every snapshot has empty
+  windows, and no stop was ever detected. Since codex-cli 0.145 the failed
+  turn's `task_complete` carries the limit error itself; unsnooze now reads
+  it and dates it from the banner the way a scraped pane is dated ("Try again
+  later." is probed). When the same turn also wrote an exhausted snapshot,
+  its exact reset still wins, and a workspace wall — in the snapshot or in
+  the banner's own words — stays a wall. Only the banner counts: Codex marks
+  billing and plan errors ("Quota exceeded…", "upgrade to Plus…") with the
+  same `usage_limit_exceeded` code, and those are not stops, nor is a bare 429,
+  which carries no reset time.
+- **Codex's current banner is recognized.** Codex now writes "You’ve hit your
+  usage limit" with a typographic apostrophe; the anchor accepts both, in
+  rollouts and in panes.
+- **A reset in the banner's own minute is not tomorrow.** Codex prints the
+  reset time without seconds, so a limit hit at 7:36:15 that resets at
+  7:36:40 says "try again at 7:36 AM" — which was read as 7:36 the next
+  morning, a day late. It now wakes at 7:37.
+
+Thanks to [@d-jiao](https://github.com/d-jiao) for the report, the fix in
+[PR #28](https://github.com/saaranshM/unsnooze/pull/28), and checking it
+against 523 real rollouts.
 
 ## 1.19.0 — 2026-09-10
 

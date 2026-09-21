@@ -1,13 +1,13 @@
-// Codex rollout-line parser: limit stops never reach rollout files as Error
-// events (not persisted), but every turn writes token_count events carrying a
-// rate_limits snapshot with used_percent + resets_at epochs. Fixture shapes
-// captured from a real ~/.codex/sessions rollout.
+// Codex rollout-line parser: every turn writes token_count events carrying a
+// rate_limits snapshot with used_percent + resets_at epochs, and (since
+// codex-cli 0.145) a failed turn's task_complete carries the error with the
+// banner text. Fixture shapes captured from real ~/.codex/sessions rollouts.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseRolloutLine, rolloutMeta } from '../src/watchers/codex.js';
+import { parseRolloutLine, parseRolloutLines, rolloutMeta } from '../src/watchers/codex.js';
 
 const DIR = mkdtempSync(join(tmpdir(), 'unsnooze-codex-watch-test-'));
 after(() => rmSync(DIR, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
@@ -251,4 +251,181 @@ test('a window at 99.x% governs a workspace reason just like an exhausted one', 
   assert.equal(c.reachedType, 'workspace_owner_usage_limit_reached');
   // Both spent: the later reset governs, as with exhausted windows.
   assert.equal(parseRolloutLine(reached('workspace_member_credits_depleted', 99.2, 99.4)).limitType, 'weekly');
+});
+
+// --- persisted task_complete errors (codex-cli ≥ 0.145) ---
+// Verbatim from a ChatGPT desktop app rollout. Behind an OpenAI-compatible
+// proxy (model_providers.<x>.base_url) this is the only stop signal: the
+// X-Codex-* headers never reach Codex, so every snapshot has null windows.
+
+const STOPPED_AT = '2026-07-23T18:50:34.917Z';
+const LIMIT_MESSAGE = "You've hit your usage limit. To get more access now, send a request to your admin or try again at Jul 30th, 2026 10:33 AM.";
+
+function taskCompleteLine(error, at = STOPPED_AT) {
+  return JSON.stringify({
+    timestamp: at, type: 'event_msg',
+    payload: { type: 'task_complete', turn_id: '019f9050-ae37-74b1-944d-1dc075dbc91e',
+      last_agent_message: null, error, started_at: 1784832634, completed_at: 1784832634, duration_ms: 492 },
+  });
+}
+
+test('task_complete usage_limit_exceeded → stop carrying the banner as resetLine', () => {
+  const c = parseRolloutLine(taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' }));
+  assert.ok(c);
+  assert.equal(c.resetAt, null, 'no epoch in the error — the time-parser dates it downstream');
+  assert.equal(c.resetLine, LIMIT_MESSAGE);
+  assert.equal(c.limitType, 'unknown');
+  assert.equal(c.reachedType, null);
+  assert.equal(c.timestampMs, Date.parse(STOPPED_AT));
+});
+
+test('the banner qualifies with or without the marker', () => {
+  const textOnly = parseRolloutLine(taskCompleteLine({ message: "You've hit your usage limit. Try again at 3:51 PM." }));
+  assert.equal(textOnly?.resetLine, "You've hit your usage limit. Try again at 3:51 PM.");
+  const later = parseRolloutLine(taskCompleteLine({ message: "You’ve hit your usage limit. Try again later.",
+    codex_error_info: 'usage_limit_exceeded' }));
+  assert.equal(later?.resetLine, "You’ve hit your usage limit. Try again later.", 'unparseable → probe fallback downstream');
+  assert.equal(later.limitType, 'unknown');
+});
+
+// codex-rs sends codex_error_info "usage_limit_exceeded" for more than usage
+// limits (protocol/src/error.rs, to_codex_protocol_error): QuotaExceeded and
+// UsageNotIncluded share it. Neither is lifted by waiting, and neither says
+// "You've hit your usage limit" — the marker alone is not a stop.
+test('the usage_limit_exceeded marker without a banner is not a stop', () => {
+  for (const message of [
+    'Quota exceeded. Check your plan and billing details.',
+    'To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus.',
+  ]) {
+    assert.equal(parseRolloutLine(taskCompleteLine({ message, codex_error_info: 'usage_limit_exceeded' })), null, message);
+  }
+  // The workspace walls do carry an anchor, spelled the way codex-rs words them.
+  for (const message of [
+    'Your workspace is out of credits. Ask your workspace owner to refill in order to continue.',
+    'You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.',
+  ]) {
+    assert.ok(parseRolloutLine(taskCompleteLine({ message, codex_error_info: 'usage_limit_exceeded' })), message);
+  }
+});
+
+test('other task_complete outcomes are not stops', () => {
+  const bare429 = { message: 'exceeded retry limit, last status: 429 Too Many Requests',
+    codex_error_info: { response_too_many_failed_attempts: { http_status_code: 429 } } };
+  assert.equal(parseRolloutLine(taskCompleteLine(bare429)), null,
+    'a bare 429 has no reset time — the pane path files it under overload for the same reason');
+  assert.equal(parseRolloutLine(taskCompleteLine({ message: 'stream disconnected before completion' })), null);
+  assert.equal(parseRolloutLine(taskCompleteLine({ message: 'Server is temporarily limiting requests (not your usage limit)' })), null);
+  assert.equal(parseRolloutLine(taskCompleteLine(null)), null);
+  assert.equal(parseRolloutLine(JSON.stringify({ timestamp: TS, type: 'event_msg',
+    payload: { type: 'task_complete', last_agent_message: 'done' } })), null);
+});
+
+test('the same turn\'s exhausted snapshot lends its exact epoch to the error', () => {
+  const snapshot = tokenCountLine(rateLimits({ primary: { used_percent: 100, window_minutes: 300, resets_at: RESETS_PRIMARY } }));
+  const soon = taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' }, '2026-05-13T06:37:11.000Z');
+  const hits = parseRolloutLines([snapshot, soon]);
+  assert.equal(hits.length, 2);
+  assert.equal(hits[1].resetAt, RESETS_PRIMARY * 1000, 'epoch beats the banner\'s minute precision');
+  assert.equal(hits[1].limitType, '5h');
+  assert.equal(hits[1].resetLine, LIMIT_MESSAGE);
+  // An hour later the snapshot is stale: it must not date an unrelated stop.
+  const late = taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' }, '2026-05-13T07:37:11.000Z');
+  assert.equal(parseRolloutLines([snapshot, late])[1].resetAt, null);
+});
+
+test('behind a proxy every snapshot has null windows and only the error dates the stop', () => {
+  const proxied = tokenCountLine({ limit_id: 'codex', limit_name: null, primary: null, secondary: null,
+    credits: null, individual_limit: null, spend_control_reached: null, plan_type: null, rate_limit_reached_type: null });
+  assert.equal(parseRolloutLine(proxied), null);
+  const hits = parseRolloutLines([proxied, taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' })]);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].resetAt, null);
+  assert.equal(hits[0].resetLine, LIMIT_MESSAGE);
+});
+
+test('rolloutMeta on a reverted-thread filename falls back to the thread id, not the rollout id', () => {
+  const thread = '01a0bcf8-f716-7ac3-b90b-5a2cede549a1';
+  const path = join(DIR, `rollout-2026-09-20T14-49-02-${thread}_01a0c026-7b2f-74c3-b576-76743e1da8d7.jsonl`);
+  writeFileSync(path, 'garbage not json\n');
+  assert.equal(rolloutMeta(path).sessionId, thread);
+});
+
+// Review of #28 (Copilot): the pairing must describe a stop that still stands
+// when the error is written, not merely the last exhausted snapshot seen.
+function tokenCountAt(rl, at) {
+  return JSON.stringify({ timestamp: at, type: 'event_msg', payload: { type: 'token_count', info: null, rate_limits: rl } });
+}
+const EXHAUSTED = rateLimits({ primary: { used_percent: 100, window_minutes: 300, resets_at: RESETS_PRIMARY } });
+const LIMIT_ERROR = { message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' };
+
+test('a healthy reading of the same bucket in between ends the pairing', () => {
+  const hits = parseRolloutLines([
+    tokenCountAt(EXHAUSTED, '2026-05-13T06:37:10.000Z'),
+    tokenCountAt(rateLimits(), '2026-05-13T06:38:00.000Z'),
+    taskCompleteLine(LIMIT_ERROR, '2026-05-13T06:39:00.000Z'),
+  ]);
+  assert.equal(hits.length, 2);
+  assert.equal(hits[1].resetAt, null, 'dated by its own banner, not the cleared snapshot');
+  assert.equal(hits[1].resetLine, LIMIT_MESSAGE);
+});
+
+test('another bucket\'s healthy line from the same response does not end it', () => {
+  // Codex writes one token_count per rate-limit bucket per response.
+  const hits = parseRolloutLines([
+    tokenCountAt(EXHAUSTED, '2026-05-13T06:37:10.000Z'),
+    tokenCountAt(rateLimits({ limit_id: 'codex_other' }), '2026-05-13T06:37:10.600Z'),
+    taskCompleteLine(LIMIT_ERROR, '2026-05-13T06:37:11.000Z'),
+  ]);
+  assert.equal(hits.at(-1).resetAt, RESETS_PRIMARY * 1000);
+  assert.equal(hits.at(-1).limitType, '5h');
+});
+
+test('an epoch that had already passed when the error was written is not its reset', () => {
+  const at = Date.parse('2026-05-13T06:37:10.000Z');
+  const soon = Math.floor(at / 1000) + 60;   // the window reset a minute after the snapshot
+  const hits = parseRolloutLines([
+    tokenCountAt(rateLimits({ primary: { used_percent: 100, window_minutes: 300, resets_at: soon } }),
+      new Date(at).toISOString()),
+    taskCompleteLine(LIMIT_ERROR, new Date(at + 3 * 60_000).toISOString()),
+  ]);
+  assert.equal(hits.at(-1).resetAt, null);
+});
+
+test('a limit message that wraps onto a second line is read whole', () => {
+  const c = parseRolloutLine(taskCompleteLine({ message: "You've hit your usage limit.\nTry again at 3:51 PM." }));
+  assert.ok(c, 'the banner anchor is on the first line');
+  assert.equal(c.resetLine, 'Try again at 3:51 PM.');
+});
+
+// A workspace wall (credits depleted, no window exhausted) is filed as a model
+// limit: no reset to wait for. The same turn's task_complete error must not
+// turn it back into a stop scheduled from the banner.
+// Behind a proxy there is no snapshot to say it is a wall; the banner does.
+test('a workspace-wall banner with no snapshot is filed as a wall', () => {
+  for (const message of [
+    'Your workspace is out of credits. Add credits to continue.',
+    'You hit your spend cap set in your workspace. Increase your spend cap to continue.',
+  ]) {
+    const c = parseRolloutLine(taskCompleteLine({ message, codex_error_info: 'usage_limit_exceeded' }));
+    assert.equal(c.limitType, 'model', message);
+    assert.equal(c.resetLine, null, 'nothing to schedule — probe, then hold');
+  }
+  // An ordinary usage limit is still dated from its banner.
+  const plain = parseRolloutLine(taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' }));
+  assert.equal(plain.limitType, 'unknown');
+  assert.equal(plain.resetLine, LIMIT_MESSAGE);
+});
+
+test('a limit error in the same turn as a workspace wall stays a wall', () => {
+  const wall = tokenCountAt(rateLimits({
+    plan_type: 'business', rate_limit_reached_type: 'workspace_member_credits_depleted',
+    primary: { used_percent: 97, window_minutes: 300, resets_at: RESETS_PRIMARY },
+  }), '2026-05-13T06:37:10.000Z');
+  const error = taskCompleteLine({ message: 'Your workspace is out of credits. Ask your workspace owner to add more.',
+    codex_error_info: 'usage_limit_exceeded' }, '2026-05-13T06:37:10.500Z');
+  const last = parseRolloutLines([wall, error]).at(-1);
+  assert.equal(last.limitType, 'model');
+  assert.equal(last.resetAt, null);
+  assert.equal(last.resetLine, null, 'nothing to schedule — probe, then hold for a human');
+  assert.equal(last.reachedType, 'workspace_member_credits_depleted');
 });
