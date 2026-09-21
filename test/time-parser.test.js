@@ -133,6 +133,25 @@ test('real fixture: session limit · resets 10:40pm (Asia/Calcutta) anchors to b
   assert.notEqual(at, expected + 86_400_000);
 });
 
+// Codex prints the reset time without seconds (codex-rs format_retry_timestamp:
+// "%-I:%M %p"). A limit hit at 7:36:15 with the reset at 7:36:40 reads "try
+// again at 7:36 AM": that is this minute, not tomorrow's 7:36 — which is what
+// a dated banner rolled to, waking the session a day late. The same banner
+// from a minute that has fully passed is still tomorrow.
+test('a dated banner naming its own minute resets in that minute, not tomorrow', () => {
+  const p = parseResetTime("You've hit your usage limit. To get more access now, send a request to your admin or try again at 7:36 AM.");
+  const bannerAt = new Date(2026, 6, 23, 7, 36, 15).getTime();
+  const { at, source } = resetAtMs(p, { now: new Date(bannerAt), bannerAt, marginMs: MARGIN });
+  assert.equal(source, 'absolute');
+  // Due as soon as the margin has run — later than any reset inside 7:36.
+  assert.equal(at, bannerAt + MARGIN);
+  assert.ok(at >= new Date(2026, 6, 23, 7, 37, 0).getTime());
+
+  const minuteLater = new Date(2026, 6, 23, 7, 37, 5).getTime();
+  const next = resetAtMs(p, { now: new Date(minuteLater), bannerAt: minuteLater, marginMs: MARGIN });
+  assert.equal(next.at, new Date(2026, 6, 24, 7, 36, 0).getTime() + MARGIN, 'a passed minute still rolls');
+});
+
 test('stale relative banner: printed at T0, scraped at T0+2h ⇒ reset = T0+offset', () => {
   const bannerAt = new Date('2026-07-05T10:00:00Z').getTime();
   const now = new Date('2026-07-05T12:00:00Z'); // +2h
