@@ -52,9 +52,15 @@ function rolloutSnapshot(line) {
   return entry;
 }
 
-// The failed turn's task_complete error, when it is a usage limit. Only the
-// structured marker or the verbatim banner qualifies: the turn also ends in
-// task_complete for stream errors, retry exhaustion and cancellations.
+// The failed turn's task_complete error, when it is a usage limit. The turn
+// also ends in task_complete for stream errors, retry exhaustion and
+// cancellations, so only the banner itself qualifies — not the structured
+// marker alone: codex-rs (protocol/src/error.rs, to_codex_protocol_error)
+// sends codex_error_info "usage_limit_exceeded" for "Quota exceeded. Check
+// your plan and billing details." and "To use Codex with your ChatGPT plan,
+// upgrade to Plus…" too, which no amount of waiting clears. Every real usage
+// limit it words ("You’ve hit your usage limit…", "Your workspace is out of
+// credits…", "You hit your spend cap…") carries a banner anchor.
 function rolloutLimitError(line) {
   // Every line that is not a snapshot lands here, and rollout lines can be
   // large (tool output): skip the second JSON.parse unless it can be a match.
@@ -65,20 +71,18 @@ function rolloutLimitError(line) {
   const error = entry.payload.error;
   if (!error || typeof error !== 'object') return null;
   const message = typeof error.message === 'string' ? error.message.trim() : '';
-  const info = error.codex_error_info;
-  const structured = info === 'usage_limit_exceeded'
-    || (info && typeof info === 'object' && 'usage_limit_exceeded' in info);
+  if (!message) return null;
   // The message as pane text, with the same anchors and the same reset-line
   // selection as the scraped TUI — so the two paths cannot disagree about a
   // banner. All of it (tail 0): a message that wraps its reset time onto a
   // second line must still be read whole.
-  const detected = message ? detectLimit(message, 0, codexPatterns) : { hit: false, limitType: null, resetLine: null };
-  if (!structured && !detected.hit) return null;
+  const detected = detectLimit(message, 0, codexPatterns);
+  if (!detected.hit) return null;
   const ts = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
   return {
-    limitType: detected.hit ? detected.limitType : 'unknown',
+    limitType: detected.limitType,
     resetAt: null,
-    resetLine: detected.resetLine || message || null,
+    resetLine: detected.resetLine || message,
     reachedType: null,
     timestampMs: Number.isFinite(ts) ? ts : null,
   };

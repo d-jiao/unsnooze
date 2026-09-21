@@ -215,13 +215,33 @@ test('task_complete usage_limit_exceeded → stop carrying the banner as resetLi
   assert.equal(c.timestampMs, Date.parse(STOPPED_AT));
 });
 
-test('the banner alone qualifies without the marker; the marker alone qualifies without a parseable banner', () => {
+test('the banner qualifies with or without the marker', () => {
   const textOnly = parseRolloutLine(taskCompleteLine({ message: "You've hit your usage limit. Try again at 3:51 PM." }));
   assert.equal(textOnly?.resetLine, "You've hit your usage limit. Try again at 3:51 PM.");
-  const markerOnly = parseRolloutLine(taskCompleteLine({ message: 'Usage limit reached.', codex_error_info: 'usage_limit_exceeded' }));
-  assert.ok(markerOnly, 'structured marker is authoritative');
-  assert.equal(markerOnly.resetLine, 'Usage limit reached.');   // unparseable → probe fallback downstream
-  assert.equal(markerOnly.limitType, 'unknown');
+  const later = parseRolloutLine(taskCompleteLine({ message: "You’ve hit your usage limit. Try again later.",
+    codex_error_info: 'usage_limit_exceeded' }));
+  assert.equal(later?.resetLine, "You’ve hit your usage limit. Try again later.", 'unparseable → probe fallback downstream');
+  assert.equal(later.limitType, 'unknown');
+});
+
+// codex-rs sends codex_error_info "usage_limit_exceeded" for more than usage
+// limits (protocol/src/error.rs, to_codex_protocol_error): QuotaExceeded and
+// UsageNotIncluded share it. Neither is lifted by waiting, and neither says
+// "You've hit your usage limit" — the marker alone is not a stop.
+test('the usage_limit_exceeded marker without a banner is not a stop', () => {
+  for (const message of [
+    'Quota exceeded. Check your plan and billing details.',
+    'To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus.',
+  ]) {
+    assert.equal(parseRolloutLine(taskCompleteLine({ message, codex_error_info: 'usage_limit_exceeded' })), null, message);
+  }
+  // The workspace walls do carry an anchor, spelled the way codex-rs words them.
+  for (const message of [
+    'Your workspace is out of credits. Ask your workspace owner to refill in order to continue.',
+    'You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.',
+  ]) {
+    assert.ok(parseRolloutLine(taskCompleteLine({ message, codex_error_info: 'usage_limit_exceeded' })), message);
+  }
 });
 
 test('other task_complete outcomes are not stops', () => {
