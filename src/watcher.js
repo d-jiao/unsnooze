@@ -23,8 +23,10 @@ import {
 import { getMultiplexer } from './multiplexer.js';
 import { parseTranscriptLine } from './watchers/claude.js';
 import { parseRolloutLines, rolloutMeta } from './watchers/codex.js';
-import { ROLLOUT_RE } from './agents/codex.js';
-import { parseResetTime, resetAtMs } from './time-parser.js';
+import { ROLLOUT_RE, rolloutId } from './agents/codex.js';
+import { parseResetTime, resetAtMs, sourceRank } from './time-parser.js';
+import { getAgent } from './agents/index.js';
+import { modelRemedy } from './patterns.js';
 import { upsertSession, readState, updateState } from './state.js';
 import { getConfig } from './settings.js';
 import { notify } from './notify.js';
@@ -99,12 +101,14 @@ export function codexSource({ roots }) {
         // dispatchCandidate exactly like a scraped pane when no epoch is known.
         resetLine: last.resetLine || null,
         resetAt: last.resetAt,
+        reason: last.reachedType || null,
         origin: meta.originator,
         timestampMs: last.timestampMs,
       }];
     },
-    usage(lines) {
-      return lines.map(extractCodexUsage).filter(Boolean);
+    usage(lines, path) {
+      const rollout = rolloutId(path);
+      return lines.map(line => extractCodexUsage(line, { rollout })).filter(Boolean);
     },
   };
 }
@@ -186,16 +190,31 @@ export function dispatchCandidate(c) {
     : null;
   if (existing && existing.status === 'cancelled') return;
   if (existing && (existing.status === 'stopped' || existing.status === 'resuming')) {
+    let kept = false;
     updateState(state => {
       const s = state.sessions[existing.key];
       if (s && (s.status === 'stopped' || s.status === 'resuming')) {
-        s.resetAt = at;
-        s.resetSource = source;
+        // A weaker estimate never replaces a stronger one that still stands —
+        // the rule monitor.js §7 and upsertSession's merge already apply. One
+        // Codex stop's token_count line and its task_complete error can land
+        // in different ticks, and a "Try again later." banner must not turn
+        // the exact epoch the snapshot gave into a 15-minute probe.
+        kept = sourceRank(source) < sourceRank(s.resetSource) && s.resetAt > Date.now();
+        if (!kept) {
+          s.resetAt = at;
+          s.resetSource = source;
+          if (c.limitType && c.limitType !== 'unknown') s.limitType = c.limitType;
+          // The reason belongs to the stop it came with: a later plain stop
+          // must not keep reporting an earlier workspace wall.
+          if (c.reason) s.limitReason = c.reason;
+          else delete s.limitReason;
+        }
         if (bannerAt != null) s.bannerAt = bannerAt;
-        if (c.limitType && c.limitType !== 'unknown') s.limitType = c.limitType;
       }
     });
-    log(`refreshed reset for tracked stop: session=${c.sessionId} resetAt=${new Date(at).toISOString()}`);
+    log(kept
+      ? `kept the stronger reset for tracked stop: session=${c.sessionId} (${source} would have replaced it)`
+      : `refreshed reset for tracked stop: session=${c.sessionId} resetAt=${new Date(at).toISOString()}`);
     return;
   }
 
@@ -219,6 +238,10 @@ export function dispatchCandidate(c) {
     lastError: null,
   };
   if (c.env) record.env = c.env;   // e.g. CLAUDE_CONFIG_DIR for sandboxed desktop sessions
+  // e.g. Codex's rate_limit_reached_type. Cleared explicitly when absent:
+  // upsertSession merges into an older record of the same session.
+  if (c.reason) record.limitReason = c.reason;
+  else if (existing?.limitReason) record.limitReason = null;
   // Raw reset without margin for calibration window math.
   const rawResetMs = c.resetAt != null
     ? c.resetAt
@@ -237,8 +260,16 @@ export function dispatchCandidate(c) {
   upsertSession(record, {
     after: calSample ? (state) => applyCalibrationToState(state, calSample) : null,
   });
-  log(`limit stop via transcript: agent=${c.agent} session=${c.sessionId || '?'} origin=${c.origin || '?'} resetAt=${new Date(at).toISOString()} (${source})`);
-  notify('limit hit 😴', `${c.cwd || c.agent}: tracked — resumes when the limit resets`);
+  log(`limit stop via transcript: agent=${c.agent} session=${c.sessionId || '?'} origin=${c.origin || '?'} resetAt=${new Date(at).toISOString()} (${source})${c.reason ? ` reason=${c.reason}` : ''}`);
+  // A model limit (a Codex workspace wall, say) is not lifted by waiting, so
+  // "resumes when the limit resets" would be a promise nothing keeps — say
+  // what it needs instead, as the pane monitor does.
+  if (record.limitType === 'model') {
+    const agent = getAgent(c.agent);
+    notify(`${agent.name} hit a model limit — needs you`, `${c.cwd || c.agent}: ${modelRemedy(agent)}`);
+  } else {
+    notify('limit hit 😴', `${c.cwd || c.agent}: tracked — resumes when the limit resets`);
+  }
 }
 
 function loadOffsets(path) {

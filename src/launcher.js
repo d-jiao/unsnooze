@@ -38,7 +38,14 @@ export function resolvePaneOwner(muxName, env = process.env) {
 
 function runUnwatched(agent, args, reason) {
   if (reason) process.stderr.write(`unsnooze: ${reason}\n`);
+  return runPassthrough(agent, args);
+}
+
+// spawnSync reports a binary it could not start as r.error with no status;
+// `r.status ?? 1` alone turned `spawn codex ENOENT` into a silent exit 1.
+function runPassthrough(agent, args) {
   const r = spawnSync(agent.bin, args, { stdio: 'inherit', env: { ...process.env, UNSNOOZE_ACTIVE: '1' } });
+  if (r.error) return launchFailed(agent, r.error);
   return r.status ?? 1;
 }
 
@@ -54,8 +61,7 @@ export function runLauncher(args, agentId = 'claude', { processBirthFn = process
   // or spawning a watcher for `claude --help` flashes the screen and slows down
   // simple queries.
   if (process.env.UNSNOOZE_ACTIVE === '1' || isPassthrough(args) || !getConfig(`agents.${agent.id}`)) {
-    const r = spawnSync(agent.bin, args, { stdio: 'inherit', env: { ...process.env, UNSNOOZE_ACTIVE: '1' } });
-    return r.status ?? 1;
+    return runPassthrough(agent, args);
   }
 
   // Flags the user wants on every session they start (claude's --autocompact
@@ -166,10 +172,17 @@ export function runLauncher(args, agentId = 'claude', { processBirthFn = process
     UNSNOOZE_PANE: pane || '', UNSNOOZE_PANE_OWNER: paneOwner || '',
     UNSNOOZE_LEASE_ID: leaseId,
   };
-  const child = spawn(agent.bin, args, {
-    stdio: 'inherit',
-    env: childEnv,
-  });
+  // The bin can be a path we resolved ourselves (a Windows .cmd shim, say).
+  // Node ≥ 20.12 refuses to spawn .bat/.cmd without a shell, and depending on
+  // the version that is a synchronous throw rather than an 'error' event —
+  // either way it has to come out as the same "failed to launch" line, with
+  // the reason, never as a crash with no exit code for the resumer to read.
+  let child;
+  try {
+    child = spawn(agent.bin, args, { stdio: 'inherit', env: childEnv });
+  } catch (err) {
+    return launchFailed(agent, err);
+  }
   const lease = pane && child.pid ? {
     leaseId, mux: mux.name, paneOwner, pane, agent: agent.id,
     pid: child.pid, pidBirth: processBirthFn(child.pid),
@@ -186,8 +199,19 @@ export function runLauncher(args, agentId = 'claude', { processBirthFn = process
     child.on('exit', code => { cleanup(); resolve(code ?? 1); });
     child.on('error', err => {
       cleanup();
-      process.stderr.write(`unsnooze: failed to launch ${agent.bin}: ${err.message}\n`);
-      resolve(127);
+      resolve(launchFailed(agent, err));
     });
   });
+}
+
+// One place for the message, because the resumer reads it back out of the
+// headless log when a revival dies (#25). 127 like a shell's "command not
+// found"; the hint names the one misconfiguration that produces EINVAL here.
+function launchFailed(agent, err) {
+  process.stderr.write(`unsnooze: failed to launch ${agent.bin}: ${err.message}\n`);
+  if (/\.(cmd|bat)$/i.test(String(agent.bin))) {
+    process.stderr.write(`unsnooze: ${agent.bin} is a .cmd/.bat shim, which cannot be launched directly — `
+      + `point UNSNOOZE_${agent.id.toUpperCase()}_BIN at the .exe\n`);
+  }
+  return 127;
 }

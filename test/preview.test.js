@@ -91,6 +91,43 @@ test('recycled pane (stamp mismatch) → plan: reopen into the revival session',
   assert.match(plan.target.session, /unsnooze-resumed/);
 });
 
+// reopen() asks the adapter for the argv form when the backend has no pane;
+// preview has to ask the same way, or it narrates a typed resume (claude) and
+// a TUI command (codex) that dispatch will never run.
+test('headless → plan: reopen with the argv dispatch actually uses', async () => {
+  const { createHeadless } = await import('../src/multiplexers/headless.js');
+  const mux = createHeadless({ env: {}, alive: () => false });
+  const claude = await planFor(seed({ pane: null, mux: 'headless' }), { mux });
+  assert.equal(claude.action, 'reopen');
+  assert.equal(claude.messageViaPane, false, 'nothing is typed on headless — the prompt rides in argv');
+  assert.match(claude.argv.at(-1), /Continue where you left off/);
+
+  const rec = seed({ pane: null, mux: 'headless', agent: 'codex' });
+  const codex = await planFor(rec, { mux });
+  assert.deepEqual(codex.argv.slice(0, 5), ['codex', 'exec', '--skip-git-repo-check', 'resume', rec.sessionId]);
+});
+
+// `codex exec resume` rejects -s/-p/--add-dir after the subcommand (exit 2,
+// "unexpected argument"); `exec` itself takes them. resumeExtraArgs set to
+// match a normal launch must land where they parse, or every revival dies.
+test('codex resumeExtraArgs go after `exec` on headless, and stay appended in a pane', async () => {
+  const { createHeadless } = await import('../src/multiplexers/headless.js');
+  process.env.UNSNOOZE_RESUME_EXTRA_ARGS_CODEX = '-s workspace-write';
+  try {
+    const rec = seed({ pane: null, mux: 'headless', agent: 'codex' });
+    const headless = await planFor(rec, { mux: createHeadless({ env: {}, alive: () => false }) });
+    assert.deepEqual(headless.argv.slice(0, 7),
+      ['codex', 'exec', '-s', 'workspace-write', '--skip-git-repo-check', 'resume', rec.sessionId]);
+    const paned = await planFor(seed({ agent: 'codex', leaseId: 'L-mine' }),
+      { mux: { ...liveClaudePane('L-other') }, matchesLease: async () => false });
+    assert.equal(paned.action, 'reopen');
+    assert.deepEqual(paned.argv.slice(0, 2), ['codex', 'resume']);
+    assert.deepEqual(paned.argv.slice(-2), ['-s', 'workspace-write']);
+  } finally {
+    delete process.env.UNSNOOZE_RESUME_EXTRA_ARGS_CODEX;
+  }
+});
+
 test('busy pane → defer, no message shown as pending keystrokes', async () => {
   const rec = seed({});
   const mux = { ...liveClaudePane(), capturePane: async () => 'thinking… esc to interrupt' };
