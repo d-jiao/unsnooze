@@ -265,3 +265,50 @@ test('rolloutMeta on a reverted-thread filename falls back to the thread id, not
   writeFileSync(path, 'garbage not json\n');
   assert.equal(rolloutMeta(path).sessionId, thread);
 });
+
+// Review of #28 (Copilot): the pairing must describe a stop that still stands
+// when the error is written, not merely the last exhausted snapshot seen.
+function tokenCountAt(rl, at) {
+  return JSON.stringify({ timestamp: at, type: 'event_msg', payload: { type: 'token_count', info: null, rate_limits: rl } });
+}
+const EXHAUSTED = rateLimits({ primary: { used_percent: 100, window_minutes: 300, resets_at: RESETS_PRIMARY } });
+const LIMIT_ERROR = { message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' };
+
+test('a healthy reading of the same bucket in between ends the pairing', () => {
+  const hits = parseRolloutLines([
+    tokenCountAt(EXHAUSTED, '2026-05-13T06:37:10.000Z'),
+    tokenCountAt(rateLimits(), '2026-05-13T06:38:00.000Z'),
+    taskCompleteLine(LIMIT_ERROR, '2026-05-13T06:39:00.000Z'),
+  ]);
+  assert.equal(hits.length, 2);
+  assert.equal(hits[1].resetAt, null, 'dated by its own banner, not the cleared snapshot');
+  assert.equal(hits[1].resetLine, LIMIT_MESSAGE);
+});
+
+test('another bucket\'s healthy line from the same response does not end it', () => {
+  // Codex writes one token_count per rate-limit bucket per response.
+  const hits = parseRolloutLines([
+    tokenCountAt(EXHAUSTED, '2026-05-13T06:37:10.000Z'),
+    tokenCountAt(rateLimits({ limit_id: 'codex_other' }), '2026-05-13T06:37:10.600Z'),
+    taskCompleteLine(LIMIT_ERROR, '2026-05-13T06:37:11.000Z'),
+  ]);
+  assert.equal(hits.at(-1).resetAt, RESETS_PRIMARY * 1000);
+  assert.equal(hits.at(-1).limitType, '5h');
+});
+
+test('an epoch that had already passed when the error was written is not its reset', () => {
+  const at = Date.parse('2026-05-13T06:37:10.000Z');
+  const soon = Math.floor(at / 1000) + 60;   // the window reset a minute after the snapshot
+  const hits = parseRolloutLines([
+    tokenCountAt(rateLimits({ primary: { used_percent: 100, window_minutes: 300, resets_at: soon } }),
+      new Date(at).toISOString()),
+    taskCompleteLine(LIMIT_ERROR, new Date(at + 3 * 60_000).toISOString()),
+  ]);
+  assert.equal(hits.at(-1).resetAt, null);
+});
+
+test('a limit message that wraps onto a second line is read whole', () => {
+  const c = parseRolloutLine(taskCompleteLine({ message: "You've hit your usage limit.\nTry again at 3:51 PM." }));
+  assert.ok(c, 'the banner anchor is on the first line');
+  assert.equal(c.resetLine, 'Try again at 3:51 PM.');
+});

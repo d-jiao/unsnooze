@@ -56,7 +56,9 @@ function rolloutSnapshot(line) {
 // structured marker or the verbatim banner qualifies: the turn also ends in
 // task_complete for stream errors, retry exhaustion and cancellations.
 function rolloutLimitError(line) {
-  if (!line || !line.trim()) return null;
+  // Every line that is not a snapshot lands here, and rollout lines can be
+  // large (tool output): skip the second JSON.parse unless it can be a match.
+  if (!line || !line.includes('"task_complete"')) return null;
   let entry;
   try { entry = JSON.parse(line); } catch { return null; }
   if (entry?.type !== 'event_msg' || entry.payload?.type !== 'task_complete') return null;
@@ -66,9 +68,11 @@ function rolloutLimitError(line) {
   const info = error.codex_error_info;
   const structured = info === 'usage_limit_exceeded'
     || (info && typeof info === 'object' && 'usage_limit_exceeded' in info);
-  // One line of pane text, same anchors and same reset-line selection as
-  // the scraped TUI — so the two paths cannot disagree about a banner.
-  const detected = message ? detectLimit(message, 1, codexPatterns) : { hit: false, limitType: null, resetLine: null };
+  // The message as pane text, with the same anchors and the same reset-line
+  // selection as the scraped TUI — so the two paths cannot disagree about a
+  // banner. All of it (tail 0): a message that wraps its reset time onto a
+  // second line must still be read whole.
+  const detected = message ? detectLimit(message, 0, codexPatterns) : { hit: false, limitType: null, resetLine: null };
   if (!structured && !detected.hit) return null;
   const ts = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
   return {
@@ -98,6 +102,9 @@ function parseSnapshot(entry, previous = null) {
     .map(k => rl[k])
     .filter(w => w && typeof w === 'object');
   let binding = null;
+  // The rate-limit bucket the binding window belongs to (Codex defaults a
+  // missing limit_id to "codex"). parseRolloutLines pairs errors by it.
+  let bucket = rl.limit_id ?? 'codex';
   const exhausted = windows.filter(w => (w.used_percent ?? 0) >= 100);
   if (exhausted.length > 0) {
     binding = exhausted.reduce((a, b) => ((b.resets_at || 0) > (a.resets_at || 0) ? b : a));
@@ -120,6 +127,7 @@ function parseSnapshot(entry, previous = null) {
         && Number.isFinite(primary.used_percent) && primary.used_percent >= 99
         && Number.isFinite(primary.resets_at) && primary.resets_at * 1000 > ts) {
       binding = primary;
+      bucket = prior.limit_id;
       const secondary = prior.secondary;
       if (Number.isFinite(secondary?.used_percent) && secondary.used_percent >= 100
           && Number.isFinite(secondary.resets_at) && secondary.resets_at > binding.resets_at) {
@@ -134,6 +142,7 @@ function parseSnapshot(entry, previous = null) {
     resetAt: binding.resets_at ? binding.resets_at * 1000 : null,
     reachedType: rl.rate_limit_reached_type || null,
     timestampMs: Number.isFinite(ts) ? ts : null,
+    bucket,
   };
 }
 
@@ -166,8 +175,17 @@ function previousSnapshot(path, offset) {
 // A snapshot stop and the task_complete error of the same turn describe one
 // event: keep the epoch (exact) and let the banner only fill in what the
 // snapshot lacks. Bound the pairing to the same batch and a short window so a
-// stale exhausted snapshot never lends its epoch to a later, unrelated stop.
+// stale exhausted snapshot never lends its epoch to a later, unrelated stop —
+// and to a stop that still stands when the error is written: its epoch must
+// not have passed yet, and no later reading of the same bucket may show it
+// cleared. Only the same bucket: Codex writes one token_count line per
+// rate-limit bucket per response, so a healthy `codex_other` line right after
+// an exhausted account line says nothing about the account.
 const SNAPSHOT_PAIR_WINDOW_MS = 5 * 60_000;
+
+function describesWindows(rl) {
+  return ['primary', 'secondary'].some(k => rl[k] && typeof rl[k] === 'object');
+}
 
 export function parseRolloutLines(lines, { path, offset } = {}) {
   let previous;
@@ -180,7 +198,15 @@ export function parseRolloutLines(lines, { path, offset } = {}) {
         previous = previousSnapshot(path, offset);
       }
       const hit = parseSnapshot(snapshot, previous);
-      if (hit) { hits.push(hit); lastSnapshotHit = hit; }
+      if (hit) {
+        hits.push(hit);
+        lastSnapshotHit = hit;
+      } else if (lastSnapshotHit) {
+        const rl = snapshot.payload.rate_limits;
+        if ((rl.limit_id ?? 'codex') === lastSnapshotHit.bucket && describesWindows(rl)) {
+          lastSnapshotHit = null;
+        }
+      }
       previous = snapshot;
       continue;
     }
@@ -190,7 +216,8 @@ export function parseRolloutLines(lines, { path, offset } = {}) {
       && lastSnapshotHit.resetAt
       && Number.isFinite(error.timestampMs) && Number.isFinite(lastSnapshotHit.timestampMs)
       && error.timestampMs >= lastSnapshotHit.timestampMs
-      && error.timestampMs - lastSnapshotHit.timestampMs <= SNAPSHOT_PAIR_WINDOW_MS;
+      && error.timestampMs - lastSnapshotHit.timestampMs <= SNAPSHOT_PAIR_WINDOW_MS
+      && lastSnapshotHit.resetAt > error.timestampMs;
     if (paired) {
       error.resetAt = lastSnapshotHit.resetAt;
       if (error.limitType === 'unknown') error.limitType = lastSnapshotHit.limitType;
