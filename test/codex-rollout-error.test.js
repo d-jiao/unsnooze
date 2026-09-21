@@ -92,3 +92,27 @@ test('a bare 429 in the same kind of file is not a stop', async () => {
   assert.equal(await watcher.tick(), 0);
   assert.equal(Object.values(readState().sessions).filter(s => s.cwd === root).length, 0);
 });
+
+test('a workspace wall and its limit error land as one probed model-limit stop', async () => {
+  const thread = '01a0bcf8-0000-7ac3-b90b-00000000a11a';
+  const root = join(DIR, 'wall');
+  mkdirSync(root);
+  const file = join(root, `rollout-2026-09-20T14-49-02-${thread}.jsonl`);
+  writeFileSync(file, JSON.stringify({ timestamp: new Date(STOPPED - 5000).toISOString(), type: 'session_meta',
+    payload: { id: thread, cwd: root, originator: 'codex_work_desktop' } }) + '\n');
+  const watcher = createWatcher({
+    sources: [codexSource({ roots: [root] })], offsetsPath: join(root, 'offsets.json'), now: () => STOPPED + 5000,
+  });
+  await watcher.tick();
+  appendFileSync(file, line({ type: 'token_count', info: null, rate_limits: {
+    limit_id: 'codex', primary: { used_percent: 97, window_minutes: 300, resets_at: Math.floor(STOPPED / 1000) + 3600 },
+    secondary: null, credits: null, plan_type: 'business', rate_limit_reached_type: 'workspace_member_credits_depleted',
+  } }, STOPPED - 500) + line({ type: 'task_complete', turn_id: 'x', last_agent_message: null,
+    error: { message: 'Your workspace is out of credits. Ask your workspace owner to add more.',
+      codex_error_info: 'usage_limit_exceeded' } }));
+  assert.equal(await watcher.tick(), 1);
+  const record = Object.values(readState().sessions).find(s => s.sessionId === thread);
+  assert.equal(record.limitType, 'model');
+  assert.equal(record.resetSource, 'fallback', 'probed, never scheduled against a reset that clears nothing');
+  assert.equal(record.limitReason, 'workspace_member_credits_depleted');
+});

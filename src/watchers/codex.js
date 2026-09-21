@@ -61,6 +61,10 @@ function rolloutSnapshot(line) {
 // upgrade to Plus…" too, which no amount of waiting clears. Every real usage
 // limit it words ("You’ve hit your usage limit…", "Your workspace is out of
 // credits…", "You hit your spend cap…") carries a banner anchor.
+// codex-rs words the workspace walls (UsageLimitReachedError's Display):
+// "Your workspace is out of credits. …" and "You hit your spend cap set …".
+const WORKSPACE_WALL_BANNER = /Your workspace is out of credits|hit your spend cap/i;
+
 function rolloutLimitError(line) {
   // Every line that is not a snapshot lands here, and rollout lines can be
   // large (tool output): skip the second JSON.parse unless it can be a match.
@@ -79,10 +83,15 @@ function rolloutLimitError(line) {
   const detected = detectLimit(message, 0, codexPatterns);
   if (!detected.hit) return null;
   const ts = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+  // A workspace wall says what it is in words, with no time to try again at.
+  // Behind a proxy no snapshot is there to classify it, so the banner files
+  // it the way parseSnapshot files a workspace reason with no spent window:
+  // a model limit — probed, then held for a human, never woken into.
+  const wall = WORKSPACE_WALL_BANNER.test(message);
   return {
-    limitType: detected.limitType,
+    limitType: wall ? 'model' : detected.limitType,
     resetAt: null,
-    resetLine: detected.resetLine || message,
+    resetLine: wall ? null : (detected.resetLine || message),
     reachedType: null,
     timestampMs: Number.isFinite(ts) ? ts : null,
   };
@@ -159,6 +168,7 @@ function parseSnapshot(entry, previous = null) {
         resetAt: null,
         reachedType,
         timestampMs: Number.isFinite(ts) ? ts : null,
+        bucket,
       };
     }
   } else if (reachedType) {
@@ -262,16 +272,26 @@ export function parseRolloutLines(lines, { path, offset } = {}) {
     }
     const error = rolloutLimitError(line);
     if (!error) continue;
-    const paired = lastSnapshotHit
-      && lastSnapshotHit.resetAt
-      && Number.isFinite(error.timestampMs) && Number.isFinite(lastSnapshotHit.timestampMs)
-      && error.timestampMs >= lastSnapshotHit.timestampMs
-      && error.timestampMs - lastSnapshotHit.timestampMs <= SNAPSHOT_PAIR_WINDOW_MS
-      && lastSnapshotHit.resetAt > error.timestampMs;
+    const stop = lastSnapshotHit;
+    const paired = stop
+      && Number.isFinite(error.timestampMs) && Number.isFinite(stop.timestampMs)
+      && error.timestampMs >= stop.timestampMs
+      && error.timestampMs - stop.timestampMs <= SNAPSHOT_PAIR_WINDOW_MS
+      // A workspace wall has no epoch to lend, and pairs anyway (below).
+      && (stop.resetAt ? stop.resetAt > error.timestampMs : stop.limitType === 'model');
     if (paired) {
-      error.resetAt = lastSnapshotHit.resetAt;
-      if (error.limitType === 'unknown') error.limitType = lastSnapshotHit.limitType;
-      error.reachedType = lastSnapshotHit.reachedType;
+      error.resetAt = stop.resetAt;
+      error.reachedType = stop.reachedType;
+      if (stop.limitType === 'model') {
+        // The snapshot already said what this is: a workspace wall (credits
+        // depleted, workspace cap) that no reset takes down. The banner must
+        // not turn it back into a waitable stop — probe, then hold for a
+        // human, exactly as parseSnapshot filed it.
+        error.limitType = 'model';
+        error.resetLine = null;
+      } else if (error.limitType === 'unknown') {
+        error.limitType = stop.limitType;
+      }
     }
     hits.push(error);
   }

@@ -396,3 +396,36 @@ test('a limit message that wraps onto a second line is read whole', () => {
   assert.ok(c, 'the banner anchor is on the first line');
   assert.equal(c.resetLine, 'Try again at 3:51 PM.');
 });
+
+// A workspace wall (credits depleted, no window exhausted) is filed as a model
+// limit: no reset to wait for. The same turn's task_complete error must not
+// turn it back into a stop scheduled from the banner.
+// Behind a proxy there is no snapshot to say it is a wall; the banner does.
+test('a workspace-wall banner with no snapshot is filed as a wall', () => {
+  for (const message of [
+    'Your workspace is out of credits. Add credits to continue.',
+    'You hit your spend cap set in your workspace. Increase your spend cap to continue.',
+  ]) {
+    const c = parseRolloutLine(taskCompleteLine({ message, codex_error_info: 'usage_limit_exceeded' }));
+    assert.equal(c.limitType, 'model', message);
+    assert.equal(c.resetLine, null, 'nothing to schedule — probe, then hold');
+  }
+  // An ordinary usage limit is still dated from its banner.
+  const plain = parseRolloutLine(taskCompleteLine({ message: LIMIT_MESSAGE, codex_error_info: 'usage_limit_exceeded' }));
+  assert.equal(plain.limitType, 'unknown');
+  assert.equal(plain.resetLine, LIMIT_MESSAGE);
+});
+
+test('a limit error in the same turn as a workspace wall stays a wall', () => {
+  const wall = tokenCountAt(rateLimits({
+    plan_type: 'business', rate_limit_reached_type: 'workspace_member_credits_depleted',
+    primary: { used_percent: 97, window_minutes: 300, resets_at: RESETS_PRIMARY },
+  }), '2026-05-13T06:37:10.000Z');
+  const error = taskCompleteLine({ message: 'Your workspace is out of credits. Ask your workspace owner to add more.',
+    codex_error_info: 'usage_limit_exceeded' }, '2026-05-13T06:37:10.500Z');
+  const last = parseRolloutLines([wall, error]).at(-1);
+  assert.equal(last.limitType, 'model');
+  assert.equal(last.resetAt, null);
+  assert.equal(last.resetLine, null, 'nothing to schedule — probe, then hold for a human');
+  assert.equal(last.reachedType, 'workspace_member_credits_depleted');
+});

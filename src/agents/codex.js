@@ -115,7 +115,9 @@ const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 export const ROLLOUT_RE = new RegExp(`^rollout-.*-(${UUID})(?:_${UUID})?\\.jsonl$`, 'i');
 
 // The thread uuid a rollout path names, or null for anything else. Cheaper than
-// rolloutMeta() (no read) and the same id in every rollout seen so far.
+// rolloutMeta() (no read) and the same id in every rollout seen so far. A
+// reverted thread's `…_<rollout id>` file names the same thread, so usage
+// readings compare across the two files of one conversation.
 export function rolloutId(path) {
   if (typeof path !== 'string') return null;
   const m = basename(path).match(ROLLOUT_RE);

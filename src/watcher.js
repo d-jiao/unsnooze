@@ -90,7 +90,7 @@ export function codexSource({ roots }) {
     parse(lines, path, { offset } = {}) {
       const hits = parseRolloutLines(lines, { path, offset });
       if (hits.length === 0) return [];
-      const last = hits[hits.length - 1];   // the latest snapshot governs
+      const last = hits[hits.length - 1];   // the latest snapshot or limit error governs
       const meta = rolloutMeta(path);
       return [{
         agent: 'codex',
